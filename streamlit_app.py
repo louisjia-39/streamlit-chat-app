@@ -5,7 +5,8 @@ import base64
 import hmac
 import hashlib
 from datetime import datetime, timezone
-
+from PIL import Image
+import io
 import streamlit as st
 from openai import OpenAI
 from sqlalchemy import text
@@ -131,37 +132,97 @@ ensure_tables()
 # 头像：存取（data URL，持久化到 Neon）
 # =========================
 def file_to_data_url(uploaded_file) -> str:
-    data = uploaded_file.getvalue()
-    if len(data) > 300 * 1024:  # 300KB
-        raise ValueError("图片太大，请上传 300KB 以内的图片（建议截图后再发）。")
-    mime = uploaded_file.type or "image/png"
+    """
+    上传头像：自动缩放 + 压缩，输出 data URL 存 Neon。
+    - 输入：png/jpg/jpeg
+    - 输出：优先 JPEG（体积小）；如有透明通道则用 PNG
+    - 目标：<= 2MB（若超过会自动降低 JPEG 质量）
+    """
+    MAX_AVATAR_BYTES = 2 * 1024 * 1024  # 2MB
+    MAX_SIDE = 512  # 最长边像素
+
+    raw = uploaded_file.getvalue()
+    if len(raw) == 0:
+        raise ValueError("空文件。")
+
+    # 读取图片
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+    except Exception:
+        raise ValueError("无法识别图片格式，请上传 png/jpg/jpeg。")
+
+    # 修正方向（有些手机照片会旋转）
+    try:
+        exif = img.getexif()
+        orientation = exif.get(274)  # 274 = Orientation
+        if orientation == 3:
+            img = img.rotate(180, expand=True)
+        elif orientation == 6:
+            img = img.rotate(270, expand=True)
+        elif orientation == 8:
+            img = img.rotate(90, expand=True)
+    except Exception:
+        pass
+
+    # 缩放到最长边 MAX_SIDE（保持比例）
+    w, h = img.size
+    scale = min(MAX_SIDE / max(w, h), 1.0)
+    if scale < 1.0:
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    # 判断是否有透明通道
+    has_alpha = (
+        img.mode in ("RGBA", "LA") or
+        (img.mode == "P" and "transparency" in img.info)
+    )
+
+    # 透明图：尽量保留透明（PNG），但 PNG 可能大；一般头像建议用无透明 JPEG
+    if has_alpha:
+        # 转 RGBA 并输出 PNG（带 optimize）
+        out = io.BytesIO()
+        img_rgba = img.convert("RGBA")
+        img_rgba.save(out, format="PNG", optimize=True)
+        data = out.getvalue()
+
+        # 如果 PNG 仍然 >2MB，改用 JPEG（白底），更容易压到 2MB
+        if len(data) > MAX_AVATAR_BYTES:
+            img_rgb = Image.new("RGB", img_rgba.size, (255, 255, 255))
+            img_rgb.paste(img_rgba, mask=img_rgba.split()[-1])  # alpha 作为 mask
+            data, mime = _encode_jpeg_under_limit(img_rgb, MAX_AVATAR_BYTES)
+            b64 = base64.b64encode(data).decode("utf-8")
+            return f"data:{mime};base64,{b64}"
+
+        b64 = base64.b64encode(data).decode("utf-8")
+        return f"data:image/png;base64,{b64}"
+
+    # 非透明：JPEG 压缩并确保 <= 2MB
+    img_rgb = img.convert("RGB")
+    data, mime = _encode_jpeg_under_limit(img_rgb, MAX_AVATAR_BYTES)
     b64 = base64.b64encode(data).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
 
-def upsert_avatar(character: str, avatar_data_url: str | None):
-    # session.execute 必须用 text()
-    q = text("""
-        INSERT INTO character_profiles (character, avatar_data_url)
-        VALUES (:ch, :url)
-        ON CONFLICT (character)
-        DO UPDATE SET avatar_data_url = EXCLUDED.avatar_data_url,
-                      updated_at = now();
-    """)
-    with conn.session as s:
-        s.execute(q, {"ch": character, "url": avatar_data_url})
-        s.commit()
+def _encode_jpeg_under_limit(img_rgb: "Image.Image", max_bytes: int):
+    """
+    尝试用不同 JPEG 质量输出，确保 <= max_bytes
+    """
+    for quality in [85, 80, 75, 70, 65, 60, 55, 50]:
+        out = io.BytesIO()
+        img_rgb.save(out, format="JPEG", quality=quality, optimize=True, progressive=True)
+        data = out.getvalue()
+        if len(data) <= max_bytes:
+            return data, "image/jpeg"
 
-
-def get_avatars_from_db() -> dict:
-    # conn.query 必须用字符串 SQL（不要 text()，避免 UnhashableParamError）
-    df = conn.query("SELECT character, avatar_data_url FROM character_profiles", ttl=0)
-    avatars = {}
-    for _, row in df.iterrows():
-        if row["avatar_data_url"]:
-            avatars[str(row["character"])] = str(row["avatar_data_url"])
-    return avatars
-
+    # 仍然超限：最后再强行降一点（通常不会到这里，除非图片异常大/复杂）
+    out = io.BytesIO()
+    img_rgb.save(out, format="JPEG", quality=45, optimize=True, progressive=True)
+    data = out.getvalue()
+    if len(data) > max_bytes:
+        raise ValueError("图片内容过于复杂，压缩后仍超过 2MB。请换一张更小的图或先截图裁剪。")
+    return data, "image/jpeg"
 
 # =========================
 # DB：聊天记录
