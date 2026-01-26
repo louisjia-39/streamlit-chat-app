@@ -5,11 +5,12 @@ import base64
 import hmac
 import hashlib
 from datetime import datetime, timezone
-from PIL import Image
 import io
+
 import streamlit as st
 from openai import OpenAI
 from sqlalchemy import text
+from PIL import Image
 
 
 # =========================
@@ -40,8 +41,7 @@ def require_gate():
     code_in = st.sidebar.text_input("输入访问码", type="password")
     admin_in = st.sidebar.text_input("管理员密钥（可选）", type="password")
 
-    # 移动端 Enter 不一定触发 rerun，显式按钮最稳
-    submitted = st.sidebar.button("登录")
+    submitted = st.sidebar.button("登录")  # 移动端 Enter 不一定触发 rerun，用按钮最稳
 
     if submitted:
         ok_weekly = bool(seed) and bool(code_in) and (code_in.strip().upper() == weekly_access_code(seed))
@@ -85,12 +85,11 @@ CHARACTERS = {
     "宵宫": "热情、可靠、爱照顾人、工作认真、幽默",
 }
 
-# 没设置头像图片时的默认（emoji）
 DEFAULT_AVATARS = {
     "user": "🙂",
-    "芙宁娜": "🌸",
-    "胡桃": "🧠",
-    "宵宫": "⚡",
+    "芙宁娜": "👑",
+    "胡桃": "🦋",
+    "宵宫": "🎆",
 }
 
 # 先门禁（在 DB / API 之前）
@@ -109,19 +108,34 @@ conn = st.connection("neon", type="sql")
 
 
 # =========================
-# DB：建表（只补头像表）
+# DB：建表（chat_messages + character_profiles）
 # =========================
 def ensure_tables():
-    # 注意：session.execute 必须用 text()
-    q = text("""
-        CREATE TABLE IF NOT EXISTS character_profiles (
-            character TEXT PRIMARY KEY,
-            avatar_data_url TEXT,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-    """)
     with conn.session as s:
-        s.execute(q)
+        # 聊天记录表（你之前已经建过也没关系，IF NOT EXISTS）
+        s.execute(text("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id BIGSERIAL PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                character TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """))
+        s.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_session
+            ON chat_messages(session_id, character, created_at);
+        """))
+
+        # 头像配置表
+        s.execute(text("""
+            CREATE TABLE IF NOT EXISTS character_profiles (
+                character TEXT PRIMARY KEY,
+                avatar_data_url TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """))
         s.commit()
 
 
@@ -129,33 +143,48 @@ ensure_tables()
 
 
 # =========================
-# 头像：存取（data URL，持久化到 Neon）
+# 头像：自动压缩 -> data URL -> 存 Neon
 # =========================
+def _encode_jpeg_under_limit(img_rgb: "Image.Image", max_bytes: int):
+    for quality in [85, 80, 75, 70, 65, 60, 55, 50]:
+        out = io.BytesIO()
+        img_rgb.save(out, format="JPEG", quality=quality, optimize=True, progressive=True)
+        data = out.getvalue()
+        if len(data) <= max_bytes:
+            return data, "image/jpeg"
+
+    out = io.BytesIO()
+    img_rgb.save(out, format="JPEG", quality=45, optimize=True, progressive=True)
+    data = out.getvalue()
+    if len(data) > max_bytes:
+        raise ValueError("图片内容过于复杂，压缩后仍超过 2MB。请换一张更小的图或先截图裁剪。")
+    return data, "image/jpeg"
+
+
 def file_to_data_url(uploaded_file) -> str:
     """
     上传头像：自动缩放 + 压缩，输出 data URL 存 Neon。
     - 输入：png/jpg/jpeg
-    - 输出：优先 JPEG（体积小）；如有透明通道则用 PNG
-    - 目标：<= 2MB（若超过会自动降低 JPEG 质量）
+    - 输出：优先 JPEG；如有透明通道则优先 PNG（若仍过大则转 JPEG 白底）
+    - 目标：<= 2MB
     """
-    MAX_AVATAR_BYTES = 2 * 1024 * 1024  # 2MB
-    MAX_SIDE = 512  # 最长边像素
+    MAX_AVATAR_BYTES = 2 * 1024 * 1024
+    MAX_SIDE = 512
 
     raw = uploaded_file.getvalue()
-    if len(raw) == 0:
+    if not raw:
         raise ValueError("空文件。")
 
-    # 读取图片
     try:
         img = Image.open(io.BytesIO(raw))
         img.load()
     except Exception:
         raise ValueError("无法识别图片格式，请上传 png/jpg/jpeg。")
 
-    # 修正方向（有些手机照片会旋转）
+    # 修正方向（手机照片常见）
     try:
         exif = img.getexif()
-        orientation = exif.get(274)  # 274 = Orientation
+        orientation = exif.get(274)
         if orientation == 3:
             img = img.rotate(180, expand=True)
         elif orientation == 6:
@@ -165,32 +194,29 @@ def file_to_data_url(uploaded_file) -> str:
     except Exception:
         pass
 
-    # 缩放到最长边 MAX_SIDE（保持比例）
+    # 缩放（保持比例）
     w, h = img.size
     scale = min(MAX_SIDE / max(w, h), 1.0)
     if scale < 1.0:
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-        img = img.resize((new_w, new_h), Image.LANCZOS)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-    # 判断是否有透明通道
+    # 是否透明
     has_alpha = (
         img.mode in ("RGBA", "LA") or
         (img.mode == "P" and "transparency" in img.info)
     )
 
-    # 透明图：尽量保留透明（PNG），但 PNG 可能大；一般头像建议用无透明 JPEG
     if has_alpha:
-        # 转 RGBA 并输出 PNG（带 optimize）
+        # 先 PNG
         out = io.BytesIO()
         img_rgba = img.convert("RGBA")
         img_rgba.save(out, format="PNG", optimize=True)
         data = out.getvalue()
 
-        # 如果 PNG 仍然 >2MB，改用 JPEG（白底），更容易压到 2MB
+        # PNG 仍然大：转 JPEG 白底
         if len(data) > MAX_AVATAR_BYTES:
             img_rgb = Image.new("RGB", img_rgba.size, (255, 255, 255))
-            img_rgb.paste(img_rgba, mask=img_rgba.split()[-1])  # alpha 作为 mask
+            img_rgb.paste(img_rgba, mask=img_rgba.split()[-1])
             data, mime = _encode_jpeg_under_limit(img_rgb, MAX_AVATAR_BYTES)
             b64 = base64.b64encode(data).decode("utf-8")
             return f"data:{mime};base64,{b64}"
@@ -198,37 +224,40 @@ def file_to_data_url(uploaded_file) -> str:
         b64 = base64.b64encode(data).decode("utf-8")
         return f"data:image/png;base64,{b64}"
 
-    # 非透明：JPEG 压缩并确保 <= 2MB
+    # 非透明：JPEG
     img_rgb = img.convert("RGB")
     data, mime = _encode_jpeg_under_limit(img_rgb, MAX_AVATAR_BYTES)
     b64 = base64.b64encode(data).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
 
-def _encode_jpeg_under_limit(img_rgb: "Image.Image", max_bytes: int):
-    """
-    尝试用不同 JPEG 质量输出，确保 <= max_bytes
-    """
-    for quality in [85, 80, 75, 70, 65, 60, 55, 50]:
-        out = io.BytesIO()
-        img_rgb.save(out, format="JPEG", quality=quality, optimize=True, progressive=True)
-        data = out.getvalue()
-        if len(data) <= max_bytes:
-            return data, "image/jpeg"
+def upsert_avatar(character: str, avatar_data_url: str | None):
+    q = text("""
+        INSERT INTO character_profiles (character, avatar_data_url)
+        VALUES (:ch, :url)
+        ON CONFLICT (character)
+        DO UPDATE SET avatar_data_url = EXCLUDED.avatar_data_url,
+                      updated_at = now();
+    """)
+    with conn.session as s:
+        s.execute(q, {"ch": character, "url": avatar_data_url})
+        s.commit()
 
-    # 仍然超限：最后再强行降一点（通常不会到这里，除非图片异常大/复杂）
-    out = io.BytesIO()
-    img_rgb.save(out, format="JPEG", quality=45, optimize=True, progressive=True)
-    data = out.getvalue()
-    if len(data) > max_bytes:
-        raise ValueError("图片内容过于复杂，压缩后仍超过 2MB。请换一张更小的图或先截图裁剪。")
-    return data, "image/jpeg"
+
+def get_avatars_from_db() -> dict:
+    # conn.query 必须用字符串 SQL，避免 UnhashableParamError
+    df = conn.query("SELECT character, avatar_data_url FROM character_profiles", ttl=0)
+    avatars = {}
+    for _, row in df.iterrows():
+        if row["avatar_data_url"]:
+            avatars[str(row["character"])] = str(row["avatar_data_url"])
+    return avatars
+
 
 # =========================
 # DB：聊天记录
 # =========================
 def load_messages(character: str):
-    # conn.query 用字符串 SQL
     q = """
         SELECT role, content
         FROM chat_messages
@@ -240,7 +269,6 @@ def load_messages(character: str):
 
 
 def save_message(character: str, role: str, content: str):
-    # session.execute 必须用 text()
     q = text("""
         INSERT INTO chat_messages (session_id, character, role, content)
         VALUES (:sid, :ch, :role, :content)
@@ -261,7 +289,7 @@ def get_ai_reply(character: str, history: list[dict], user_text: str) -> str:
 
     messages = [{
         "role": "system",
-        "content": f"你在扮演{character}，性格是：{CHARACTERS[character]}。请用中文自然聊天，像真实女朋友一样。",
+        "content": f"你在扮演{character}，性格是：{CHARACTERS[character]}。请用中文自然聊天，像真实聊天一样，不要AI味。",
     }]
 
     for m in history[-15:]:
@@ -279,9 +307,9 @@ def get_ai_reply(character: str, history: list[dict], user_text: str) -> str:
 def get_proactive_message(character: str, history: list[dict]) -> str:
     if "OPENAI_API_KEY" not in st.secrets:
         samples = {
-            "芙宁娜": "我刚刚想到一个问题：如果今晚只能做一件让你开心的事，你会选什么？",
-            "胡桃": "我想抛个小问题：你觉得“效率”和“幸福感”哪个更重要？为什么？",
-            "宵宫": "随机话题：你最近最上头的一首歌是什么？我去听听。",
+            "芙宁娜": "哼，你忙完了吗？我可不是在等你……只是刚好想聊两句。",
+            "胡桃": "嘿嘿！我路过！给你丢个小问题：你今天最开心的一瞬间是什么？",
+            "宵宫": "我刚忙完，突然想到你！今天过得怎么样？我来给你点能量～",
         }
         return f"（测试模式）{samples.get(character, '我来主动开个话题：你最近在忙啥？')}"
 
@@ -289,17 +317,13 @@ def get_proactive_message(character: str, history: list[dict]) -> str:
 
     messages = [{
         "role": "system",
-        "content": f"你在扮演{character}，性格是：{CHARACTERS[character]}。你现在要主动开启一个轻松自然的话题，避免AI味，像真实聊天。",
+        "content": f"你在扮演{character}，性格是：{CHARACTERS[character]}。你要主动发一条自然的开场消息，像真实朋友发微信，简短，不要连环问卷。",
     }]
 
     for m in history[-15:]:
         messages.append(m)
 
-    messages.append({
-        "role": "user",
-        "content": "请你主动发起一条消息来开启话题。要求：简短自然、像朋友发微信、不要问卷式连环提问。",
-    })
-
+    messages.append({"role": "user", "content": "请主动发起一条消息开启话题。"})
     resp = client.chat.completions.create(
         model=st.secrets.get("OPENAI_MODEL", "gpt-4o-mini"),
         messages=messages,
@@ -308,7 +332,7 @@ def get_proactive_message(character: str, history: list[dict]) -> str:
 
 
 # =========================
-# 头像：根据 DB 配置决定每条消息的 avatar
+# 头像：根据 DB 配置决定 avatar
 # =========================
 db_avatars = get_avatars_from_db()
 
@@ -316,12 +340,11 @@ db_avatars = get_avatars_from_db()
 def avatar_for(role: str, character: str):
     if role == "user":
         return DEFAULT_AVATARS["user"]
-    # assistant：优先 DB 图像，其次默认 emoji
     return db_avatars.get(character, DEFAULT_AVATARS.get(character, "🤖"))
 
 
 # =========================
-# 管理员：头像管理面板
+# 管理员：头像管理
 # =========================
 if st.session_state.get("is_admin"):
     st.sidebar.divider()
@@ -336,7 +359,7 @@ if st.session_state.get("is_admin"):
     else:
         st.sidebar.caption("当前头像：默认（未设置图片）")
 
-    up = st.sidebar.file_uploader("上传新头像（png/jpg，≤300KB）", type=["png", "jpg", "jpeg"])
+    up = st.sidebar.file_uploader("上传新头像（png/jpg，≤2MB，自动压缩）", type=["png", "jpg", "jpeg"])
 
     col1, col2 = st.sidebar.columns(2)
     with col1:
@@ -385,14 +408,14 @@ for msg in history:
         with st.chat_message("assistant", avatar=avatar_for("assistant", character)):
             st.write(msg["content"])
 
-# 按钮主动（最可靠）
+# 手动主动（最可靠）
 if proactive_now:
     rate_limit(min_interval_sec=1.0, max_per_day=200)
     proactive_text = get_proactive_message(character, history)
     save_message(character, "assistant", proactive_text)
     st.rerun()
 
-# 自动主动（只在页面有 rerun/交互时触发）
+# 自动主动（仅在页面 rerun/交互时触发）
 if auto_proactive:
     last_key = f"last_proactive_ts_{character}"
     last_ts = st.session_state.get(last_key, 0.0)
