@@ -7,6 +7,8 @@ import hashlib
 from datetime import datetime, timezone
 import io
 import html as _html
+import json
+import re
 
 import streamlit as st
 from openai import OpenAI
@@ -15,7 +17,7 @@ from PIL import Image
 
 
 # =========================
-# 基础配置
+# 配置
 # =========================
 st.set_page_config(page_title="聊天", layout="wide")
 
@@ -33,182 +35,201 @@ DEFAULT_AVATARS = {
 }
 
 DEFAULT_SETTINGS = {
-    "TEMP_CHAT": "0.95",
+    # 温度：聊天更自然，教学更稳定
+    "TEMP_CHAT": "1.05",
     "TEMP_TEACH": "0.35",
     "TOP_P": "1.0",
-    "PRESENCE_PENALTY": "0.6",
-    "FREQUENCY_PENALTY": "0.2",
+    "PRESENCE_PENALTY": "0.7",
+    "FREQUENCY_PENALTY": "0.25",
+
+    # prompt 追加（管理员可改）
     "PROMPT_CHAT_EXTRA": "",
     "PROMPT_TEACH_EXTRA": "",
+
+    # 主动聊天（管理员可控）
     "PROACTIVE_ENABLED": "1",
     "PROACTIVE_MIN_INTERVAL_MIN": "20",
     "PROACTIVE_PROB_PCT": "25",
-    # A2：时间分割条粒度
-    "TIME_DIVIDER_GRANULARITY": "minute",  # "minute" 或 "5min"
+
+    # 时间分割条粒度
+    "TIME_DIVIDER_GRANULARITY": "minute",  # minute / 5min
 }
 
+
 # =========================
-# A1/A2：WeChat-ish UI（更像微信）
+# CSS：微信风格 + 好友列表 + 未读点 + 正在输入
 # =========================
 st.markdown(
     """
 <style>
-header[data-testid="stHeader"] { display: none; }
-div[data-testid="stToolbar"] { display: none; }
-footer { display: none; }
+header[data-testid="stHeader"], div[data-testid="stToolbar"], footer { display:none !important; }
 
-/* 主背景更像微信聊天背景 */
-.main { background: #ECE5DD; }
+/* 背景更像微信 */
+.main { background:#ECE5DD; }
 
-/* 侧边栏稍微淡一点 */
-section[data-testid="stSidebar"] { background: #F7F7F7; }
-
-/* 输入框贴底 + 视觉更像微信输入区域 */
-div[data-testid="stChatInput"] {
-    position: sticky;
-    bottom: 0;
-    background: #ECE5DD;
-    padding-top: 10px;
-    padding-bottom: 12px;
-    z-index: 10;
+/* Sidebar */
+section[data-testid="stSidebar"] { background:#F7F7F7; }
+.sidebar-title { font-size:18px; font-weight:700; margin: 6px 0 10px 0; }
+.wx-list { display:flex; flex-direction:column; gap:8px; }
+.wx-item {
+  display:flex; gap:10px; align-items:center;
+  padding:10px 10px;
+  border-radius:12px;
+  border:1px solid rgba(0,0,0,.06);
+  background: rgba(255,255,255,.85);
+}
+.wx-item.active { background:#FFFFFF; border-color: rgba(0,0,0,.10); }
+.wx-item:hover { border-color: rgba(0,0,0,.14); }
+.wx-item .avatar {
+  width:40px; height:40px; border-radius:10px; overflow:hidden;
+  background: rgba(0,0,0,.06);
+  display:flex; align-items:center; justify-content:center;
+  flex: 0 0 40px;
+  position: relative;
+  font-size: 20px;
+}
+.wx-item .avatar img { width:100%; height:100%; object-fit:cover; }
+.wx-item .meta { flex:1; min-width:0; }
+.wx-item .name { font-size:15px; font-weight:700; line-height:1.2; }
+.wx-item .preview {
+  font-size:12px; color: rgba(0,0,0,.60);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  margin-top:4px;
+}
+.unread-dot {
+  width:10px; height:10px; border-radius:999px;
+  background:#FF3B30;
+  box-shadow: 0 0 0 2px rgba(255,255,255,.9);
+}
+.unread-badge {
+  min-width:18px; height:18px; padding:0 6px;
+  border-radius:999px;
+  background:#FF3B30;
+  color:white;
+  font-size:12px; line-height:18px;
+  text-align:center;
 }
 
-/* 标题 */
+/* 用按钮覆盖点击（隐藏原按钮样式） */
+div[data-testid="stSidebar"] button.friend-btn {
+  width: 100%;
+  padding: 0 !important;
+  border: none !important;
+  background: transparent !important;
+}
+div[data-testid="stSidebar"] button.friend-btn:hover {
+  background: transparent !important;
+}
+
+/* 主区域 */
 .wx-title {
-    font-size: 30px;
-    font-weight: 800;
-    margin: 10px 0 6px 0;
+  font-size: 30px; font-weight: 800;
+  margin: 10px 0 6px 0;
 }
 .wx-pill {
-    display: inline-block;
-    padding: 6px 10px;
-    border-radius: 999px;
-    background: rgba(255,255,255,.75);
-    border: 1px solid rgba(0,0,0,.06);
-    font-size: 13px;
+  display:inline-block;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(255,255,255,.75);
+  border: 1px solid rgba(0,0,0,.06);
+  font-size: 13px;
 }
 
 /* 聊天容器 */
 .wx-chat {
-    width: 100%;
-    max-width: 940px;
-    margin: 0 auto;
-    padding: 6px 10px 0 10px;
+  width:100%;
+  max-width: 940px;
+  margin:0 auto;
+  padding: 6px 10px 0 10px;
 }
 
-/* A2 时间分割条 */
-.wx-time {
-    width: 100%;
-    display: flex;
-    justify-content: center;
-    margin: 10px 0 8px 0;
-}
+/* 时间分割条 */
+.wx-time { width:100%; display:flex; justify-content:center; margin:10px 0 8px 0; }
 .wx-time span {
-    font-size: 12px;
-    color: rgba(0,0,0,.55);
-    background: rgba(255,255,255,.55);
-    border: 1px solid rgba(0,0,0,.05);
-    border-radius: 999px;
-    padding: 4px 10px;
+  font-size:12px; color: rgba(0,0,0,.55);
+  background: rgba(255,255,255,.55);
+  border: 1px solid rgba(0,0,0,.05);
+  border-radius: 999px;
+  padding: 4px 10px;
 }
 
-/* 一条消息一行 */
-.wx-row {
-    display: flex;
-    gap: 8px;
-    margin: 6px 0;
-    align-items: flex-start;
-}
+/* 消息行 */
+.wx-row { display:flex; gap:8px; margin:6px 0; align-items:flex-start; }
+.wx-row.bot { justify-content:flex-start; }
+.wx-row.user { justify-content:flex-end; }
 
-/* 左（AI） */
-.wx-row.bot { justify-content: flex-start; }
-
-/* 右（用户） */
-.wx-row.user { justify-content: flex-end; }
-
-/* 头像更贴微信：方圆角（不是完美圆），稍大一点 */
+/* 头像 */
 .wx-avatar {
-    width: 40px;
-    height: 40px;
-    border-radius: 9px;
-    overflow: hidden;
-    flex: 0 0 40px;
-    background: rgba(0,0,0,.06);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 20px;
+  width:40px; height:40px; border-radius:10px; overflow:hidden;
+  background: rgba(0,0,0,.06);
+  display:flex; align-items:center; justify-content:center;
+  flex:0 0 40px;
+  font-size:20px;
 }
-.wx-avatar img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-}
+.wx-avatar img { width:100%; height:100%; object-fit:cover; }
 
-/* 气泡：更像微信（圆角更大、阴影更轻、宽度更像） */
+/* 气泡 */
 .wx-bubble {
-    max-width: min(72%, 620px);
-    padding: 9px 12px;
-    border-radius: 14px;
-    font-size: 16px;
-    line-height: 1.55;
-    position: relative;
-    box-shadow: 0 1px 0 rgba(0,0,0,.05);
-    word-wrap: break-word;
-    white-space: pre-wrap;
+  max-width: min(72%, 620px);
+  padding: 9px 12px;
+  border-radius: 14px;
+  font-size: 16px;
+  line-height: 1.55;
+  position: relative;
+  box-shadow: 0 1px 0 rgba(0,0,0,.05);
+  word-wrap: break-word;
+  white-space: pre-wrap;
 }
+.wx-bubble.bot { background:#FFFFFF; border:1px solid rgba(0,0,0,.06); }
+.wx-bubble.user { background:#95EC69; border:1px solid rgba(0,0,0,.03); }
 
-/* 左白 */
-.wx-bubble.bot {
-    background: #FFFFFF;
-    border: 1px solid rgba(0,0,0,.06);
-}
-
-/* 右绿（微信绿更接近） */
-.wx-bubble.user {
-    background: #95EC69;
-    border: 1px solid rgba(0,0,0,.03);
-}
-
-/* 尖角：微信更小更贴近 */
+/* 尖角 */
 .wx-bubble.bot:before {
-    content: "";
-    position: absolute;
-    left: -6px;
-    top: 12px;
-    width: 0; height: 0;
-    border-top: 6px solid transparent;
-    border-bottom: 6px solid transparent;
-    border-right: 7px solid #FFFFFF;
+  content:""; position:absolute; left:-6px; top:12px; width:0; height:0;
+  border-top:6px solid transparent; border-bottom:6px solid transparent;
+  border-right:7px solid #FFFFFF;
 }
 .wx-bubble.bot:after {
-    content: "";
-    position: absolute;
-    left: -7px;
-    top: 12px;
-    width: 0; height: 0;
-    border-top: 6px solid transparent;
-    border-bottom: 6px solid transparent;
-    border-right: 7px solid rgba(0,0,0,.06);
-    z-index: -1;
+  content:""; position:absolute; left:-7px; top:12px; width:0; height:0;
+  border-top:6px solid transparent; border-bottom:6px solid transparent;
+  border-right:7px solid rgba(0,0,0,.06); z-index:-1;
 }
-
-/* 右尖角 */
 .wx-bubble.user:before {
-    content: "";
-    position: absolute;
-    right: -6px;
-    top: 12px;
-    width: 0; height: 0;
-    border-top: 6px solid transparent;
-    border-bottom: 6px solid transparent;
-    border-left: 7px solid #95EC69;
+  content:""; position:absolute; right:-6px; top:12px; width:0; height:0;
+  border-top:6px solid transparent; border-bottom:6px solid transparent;
+  border-left:7px solid #95EC69;
 }
 
-/* 让右侧气泡和头像更贴近 */
-.wx-row.user .wx-bubble { margin-right: 1px; }
-.wx-row.bot .wx-bubble { margin-left: 1px; }
+/* 输入框贴底 */
+div[data-testid="stChatInput"]{
+  position: sticky;
+  bottom: 0;
+  background: #ECE5DD;
+  padding-top: 10px;
+  padding-bottom: 12px;
+  z-index: 10;
+}
 
+/* 正在输入… */
+.typing {
+  display:flex; gap:6px; align-items:center;
+  color: rgba(0,0,0,.55);
+  font-size: 14px;
+}
+.dots span{
+  display:inline-block;
+  width:6px; height:6px; border-radius:99px;
+  background: rgba(0,0,0,.35);
+  margin-right:3px;
+  animation: blink 1s infinite;
+}
+.dots span:nth-child(2){ animation-delay: .2s; }
+.dots span:nth-child(3){ animation-delay: .4s; }
+
+@keyframes blink {
+  0%, 100% { opacity: .2; transform: translateY(0); }
+  50% { opacity: 1; transform: translateY(-2px); }
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -216,7 +237,7 @@ div[data-testid="stChatInput"] {
 
 
 # =========================
-# 访问控制 / 每周密钥（A 方案）
+# 访问控制 / 每周密钥（A）
 # =========================
 def current_week_id() -> str:
     now = datetime.now(timezone.utc)
@@ -258,7 +279,7 @@ def require_gate():
     st.stop()
 
 
-def rate_limit(min_interval_sec: float = 1.6, max_per_day: int = 300):
+def rate_limit(min_interval_sec: float = 1.4, max_per_day: int = 400):
     now_ts = time.time()
     last = st.session_state.get("last_call_ts", 0.0)
     if now_ts - last < min_interval_sec:
@@ -277,7 +298,7 @@ def rate_limit(min_interval_sec: float = 1.6, max_per_day: int = 300):
 # 先门禁
 require_gate()
 
-# Session ID
+# session id
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 
@@ -285,9 +306,17 @@ if "session_id" not in st.session_state:
 if "mode" not in st.session_state:
     st.session_state.mode = "聊天"
 
+# 默认选中角色
+if "selected_character" not in st.session_state:
+    st.session_state.selected_character = list(CHARACTERS.keys())[0]
+
+# 未读：上次查看时间（每个角色）
+if "last_seen_ts" not in st.session_state:
+    st.session_state.last_seen_ts = {ch: 0.0 for ch in CHARACTERS.keys()}
+
 
 # =========================
-# DB 连接 & 建表
+# DB
 # =========================
 conn = st.connection("neon", type="sql")
 
@@ -330,9 +359,6 @@ def ensure_tables():
 ensure_tables()
 
 
-# =========================
-# Settings：读取/写入
-# =========================
 def load_settings() -> dict:
     df = conn.query("SELECT key, value FROM app_settings", ttl=0)
     s = dict(DEFAULT_SETTINGS)
@@ -377,7 +403,7 @@ def s_bool(key: str, default: bool) -> bool:
 
 
 # =========================
-# 头像：压缩 + 存取（2MB 内）
+# 头像：压缩 <=2MB（管理员上传）
 # =========================
 def _encode_jpeg_under_limit(img_rgb: "Image.Image", max_bytes: int):
     for quality in [85, 80, 75, 70, 65, 60, 55, 50]:
@@ -429,8 +455,8 @@ def file_to_data_url(uploaded_file) -> str:
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
     has_alpha = (
-        img.mode in ("RGBA", "LA") or
-        (img.mode == "P" and "transparency" in img.info)
+        img.mode in ("RGBA", "LA")
+        or (img.mode == "P" and "transparency" in img.info)
     )
 
     if has_alpha:
@@ -488,22 +514,20 @@ def avatar_for(role: str, character: str):
 
 
 # =========================
-# DB：聊天记录（A2：带 created_at）
+# DB：消息读写
 # =========================
 def load_messages(character: str):
     q = """
-        SELECT role, content, created_at
+        SELECT id, role, content, created_at
         FROM chat_messages
         WHERE session_id = :sid AND character = :ch
         ORDER BY created_at
     """
     df = conn.query(q, params={"sid": st.session_state.session_id, "ch": character}, ttl=0)
     recs = df.to_dict("records")
-    # 统一把 created_at 变成可用 datetime（pandas/psycopg 可能返回 str）
     for r in recs:
         ca = r.get("created_at")
         if isinstance(ca, str):
-            # 兼容 ISO 字符串
             try:
                 r["created_at"] = datetime.fromisoformat(ca.replace("Z", "+00:00"))
             except Exception:
@@ -521,86 +545,107 @@ def save_message(character: str, role: str, content: str):
         s.commit()
 
 
-# =========================
-# OpenAI：聊天/教学 两种模式
-# =========================
-def build_system_prompt(character: str, mode: str) -> str:
-    base_persona = f"你在扮演{character}，性格是：{CHARACTERS[character]}。"
-
-    if mode == "教学":
-        teach_core = (
-            "你现在进入【教学模式】。\n"
-            "目标：像顶级家教一样帮助用户学习/解题。\n"
-            "要求：先澄清题目与目标；分步骤讲解；必要时反问引导；给出可操作练习与检查点；避免空话。"
-        )
-        extra = SETTINGS.get("PROMPT_TEACH_EXTRA", "")
-        return base_persona + "\n" + teach_core + ("\n" + extra if extra else "")
-    else:
-        chat_core = (
-            "你现在进入【聊天模式】。\n"
-            "要求：像真实微信聊天，不要AI味；句子自然；可以有口头禅、停顿、情绪；不要长篇论文；"
-            "避免‘作为AI’表述；可以适度反问推进聊天。"
-        )
-        extra = SETTINGS.get("PROMPT_CHAT_EXTRA", "")
-        return base_persona + "\n" + chat_core + ("\n" + extra if extra else "")
+def get_latest_message_meta(character: str):
+    q = """
+        SELECT id, role, content, created_at
+        FROM chat_messages
+        WHERE session_id = :sid AND character = :ch
+        ORDER BY created_at DESC
+        LIMIT 1
+    """
+    df = conn.query(q, params={"sid": st.session_state.session_id, "ch": character}, ttl=0)
+    if df.empty:
+        return None
+    row = df.iloc[0].to_dict()
+    ca = row.get("created_at")
+    if isinstance(ca, str):
+        try:
+            row["created_at"] = datetime.fromisoformat(ca.replace("Z", "+00:00"))
+        except Exception:
+            row["created_at"] = None
+    return row
 
 
-def call_openai(messages, temperature: float):
-    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-    resp = client.chat.completions.create(
-        model=st.secrets.get("OPENAI_MODEL", "gpt-4o-mini"),
-        messages=messages,
-        temperature=temperature,
-        top_p=s_float("TOP_P", 1.0),
-        presence_penalty=s_float("PRESENCE_PENALTY", 0.6),
-        frequency_penalty=s_float("FREQUENCY_PENALTY", 0.2),
-    )
-    return resp.choices[0].message.content
+def get_unread_count(character: str) -> int:
+    """
+    未读定义：该角色最新一条 assistant 消息时间 > last_seen_ts[character]
+    由于我们每条消息都存 created_at，所以只算一条也可；这里做“粗略计数”：
+    统计 assistant 且 created_at > last_seen_ts
+    """
+    last_seen = st.session_state.last_seen_ts.get(character, 0.0)
+    # last_seen 是 epoch 秒；SQL 用 now() 体系，直接用 created_at 比较不方便 -> 我们取全部后在 Python 数
+    hist = load_messages(character)
+    cnt = 0
+    for m in hist:
+        if m.get("role") == "assistant" and isinstance(m.get("created_at"), datetime):
+            ts = m["created_at"].timestamp()
+            if ts > last_seen:
+                cnt += 1
+    return cnt
 
 
-def get_ai_reply(character: str, history: list[dict], user_text: str, mode: str) -> str:
-    if "OPENAI_API_KEY" not in st.secrets:
-        return f"（测试模式）{character} 收到了：{user_text}"
-
-    system_prompt = build_system_prompt(character, mode)
-    messages = [{"role": "system", "content": system_prompt}]
-    for m in history[-15:]:
-        messages.append({"role": m["role"], "content": m["content"]})
-    messages.append({"role": "user", "content": user_text})
-
-    temp = s_float("TEMP_TEACH", 0.35) if mode == "教学" else s_float("TEMP_CHAT", 0.95)
-    return call_openai(messages, temp)
+def mark_seen(character: str):
+    hist = load_messages(character)
+    latest_ts = 0.0
+    for m in hist[::-1]:
+        dt = m.get("created_at")
+        if isinstance(dt, datetime):
+            latest_ts = dt.timestamp()
+            break
+    st.session_state.last_seen_ts[character] = max(st.session_state.last_seen_ts.get(character, 0.0), latest_ts)
 
 
-def get_proactive_message(character: str, history: list[dict]) -> str:
-    if "OPENAI_API_KEY" not in st.secrets:
-        samples = {
-            "芙宁娜": "哼，你忙完了吗？我可不是在等你……只是刚好想到你。",
-            "胡桃": "嘿嘿！我路过！你今天有没有发生什么离谱但好笑的事？",
-            "宵宫": "我突然想到你！今天过得怎么样？要不要来点轻松话题～",
-        }
-        return samples.get(character, "我来主动开个话题：你最近在忙啥？")
-
-    system_prompt = build_system_prompt(character, "聊天")
-    messages = [{"role": "system", "content": system_prompt}]
-    for m in history[-10:]:
-        messages.append({"role": m["role"], "content": m["content"]})
-    messages.append({"role": "user", "content": "请主动发起一条简短自然的微信开场消息，不要问卷式连环提问。"})
-    return call_openai(messages, s_float("TEMP_CHAT", 0.95))
+def preview_text(s: str, n: int = 22) -> str:
+    s = re.sub(r"\s+", " ", (s or "")).strip()
+    if len(s) <= n:
+        return s
+    return s[:n] + "…"
 
 
 # =========================
-# A1：自绘消息渲染（左右气泡）
+# 时间分割条
+# =========================
+def fmt_time_label(dt: datetime) -> str:
+    try:
+        local_dt = dt.astimezone()
+    except Exception:
+        local_dt = dt
+
+    now = datetime.now(timezone.utc)
+    try:
+        now_local = now.astimezone()
+    except Exception:
+        now_local = now
+
+    if local_dt.date() == now_local.date():
+        return local_dt.strftime("%H:%M")
+    return local_dt.strftime("%m/%d %H:%M")
+
+
+def bucket_key(dt: datetime) -> str:
+    gran = SETTINGS.get("TIME_DIVIDER_GRANULARITY", "minute")
+    try:
+        d = dt.astimezone()
+    except Exception:
+        d = dt
+    if gran == "5min":
+        m = (d.minute // 5) * 5
+        return d.replace(minute=m, second=0, microsecond=0).isoformat()
+    return d.replace(second=0, microsecond=0).isoformat()
+
+
+def render_time_divider(label: str):
+    st.markdown(f'<div class="wx-time"><span>{_html.escape(label)}</span></div>', unsafe_allow_html=True)
+
+
+# =========================
+# 微信消息渲染
 # =========================
 def _avatar_html(avatar):
     if isinstance(avatar, str) and avatar.startswith("data:"):
         return f'<div class="wx-avatar"><img src="{avatar}" /></div>'
     safe = _html.escape(str(avatar))
     return f'<div class="wx-avatar">{safe}</div>'
-
-
-def render_time_divider(label: str):
-    st.markdown(f'<div class="wx-time"><span>{_html.escape(label)}</span></div>', unsafe_allow_html=True)
 
 
 def render_message(role: str, character: str, content: str):
@@ -625,41 +670,133 @@ def render_message(role: str, character: str, content: str):
     st.markdown(html_block, unsafe_allow_html=True)
 
 
-def fmt_time_label(dt: datetime) -> str:
-    # 你在美国，这里做一个本地显示（没有用户时区就用本机/UTC）
-    # Streamlit Cloud 通常是 UTC，显示也可接受；想强制某时区再加 pytz/zoneinfo。
-    try:
-        local_dt = dt.astimezone()  # 使用运行环境本地时区
-    except Exception:
-        local_dt = dt
-
-    # 更像微信：今天只显示时:分；非今天显示月/日 时:分
-    now = datetime.now(timezone.utc)
-    try:
-        now_local = now.astimezone()
-    except Exception:
-        now_local = now
-
-    if local_dt.date() == now_local.date():
-        return local_dt.strftime("%H:%M")
-    return local_dt.strftime("%m/%d %H:%M")
-
-
-def bucket_key(dt: datetime) -> str:
-    gran = SETTINGS.get("TIME_DIVIDER_GRANULARITY", "minute")
-    try:
-        d = dt.astimezone()
-    except Exception:
-        d = dt
-    if gran == "5min":
-        m = (d.minute // 5) * 5
-        return d.replace(minute=m, second=0, microsecond=0).isoformat()
-    # minute
-    return d.replace(second=0, microsecond=0).isoformat()
+def render_typing(character: str):
+    avatar = avatar_for("assistant", character)
+    html_block = f"""
+    <div class="wx-row bot">
+        {_avatar_html(avatar)}
+        <div class="wx-bubble bot">
+            <div class="typing">
+                <div>对方正在输入</div>
+                <div class="dots"><span></span><span></span><span></span></div>
+            </div>
+        </div>
+    </div>
+    """
+    st.markdown(html_block, unsafe_allow_html=True)
 
 
 # =========================
-# 管理员后台（只有管理员看得到）
+# OpenAI：聊天/教学
+# =========================
+def build_system_prompt(character: str, mode: str) -> str:
+    base_persona = f"你在扮演{character}，性格是：{CHARACTERS[character]}。"
+
+    if mode == "教学":
+        teach_core = (
+            "你现在进入【教学模式】。\n"
+            "目标：像顶级家教一样帮助用户学习/解题。\n"
+            "要求：先澄清题目与目标；分步骤讲解；必要时反问引导；给练习与检查点；避免空话。"
+        )
+        extra = SETTINGS.get("PROMPT_TEACH_EXTRA", "")
+        return base_persona + "\n" + teach_core + ("\n" + extra if extra else "")
+
+    # 聊天模式：强制多气泡输出（JSON 数组）
+    chat_core = (
+        "你现在进入【聊天模式】。\n"
+        "要求：像真实微信聊天，不要AI味；句子自然；可以有情绪；不要长篇论文；避免‘作为AI’。\n"
+        "输出格式：只输出一个 JSON 数组，例如 [\"消息1\",\"消息2\"]。\n"
+        "规则：数组最多3条；每条1-2句话；每条尽量短（像微信）；不要在一条里塞三四句话；不要输出除 JSON 外任何文字。"
+    )
+    extra = SETTINGS.get("PROMPT_CHAT_EXTRA", "")
+    return base_persona + "\n" + chat_core + ("\n" + extra if extra else "")
+
+
+def call_openai(messages, temperature: float):
+    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+    resp = client.chat.completions.create(
+        model=st.secrets.get("OPENAI_MODEL", "gpt-4o-mini"),
+        messages=messages,
+        temperature=temperature,
+        top_p=s_float("TOP_P", 1.0),
+        presence_penalty=s_float("PRESENCE_PENALTY", 0.7),
+        frequency_penalty=s_float("FREQUENCY_PENALTY", 0.25),
+    )
+    return resp.choices[0].message.content
+
+
+def parse_chat_messages(raw: str) -> list[str]:
+    """
+    期望 raw 是 JSON 数组字符串。
+    兜底：按换行/分隔符拆，最多3条。
+    """
+    raw = (raw or "").strip()
+    try:
+        arr = json.loads(raw)
+        if isinstance(arr, list):
+            msgs = []
+            for x in arr:
+                if isinstance(x, str):
+                    t = x.strip()
+                    if t:
+                        msgs.append(t)
+            return msgs[:3] if msgs else []
+    except Exception:
+        pass
+
+    # 兜底拆分
+    parts = [p.strip() for p in re.split(r"\n+|---+|•|\u2022", raw) if p.strip()]
+    return parts[:3]
+
+
+def get_ai_reply(character: str, history: list[dict], user_text: str, mode: str) -> list[str]:
+    if "OPENAI_API_KEY" not in st.secrets:
+        return [f"（测试模式）{character} 收到了：{user_text}"]
+
+    system_prompt = build_system_prompt(character, mode)
+    messages = [{"role": "system", "content": system_prompt}]
+    for m in history[-15:]:
+        messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "user", "content": user_text})
+
+    temp = s_float("TEMP_TEACH", 0.35) if mode == "教学" else s_float("TEMP_CHAT", 1.05)
+    raw = call_openai(messages, temp)
+
+    if mode == "教学":
+        # 教学模式：单条即可
+        return [raw.strip()]
+
+    # 聊天模式：多气泡
+    msgs = parse_chat_messages(raw)
+    if not msgs:
+        msgs = [raw.strip()] if raw.strip() else ["嗯？"]
+    return msgs[:3]
+
+
+def get_proactive_message(character: str, history: list[dict]) -> list[str]:
+    """
+    主动消息也按聊天格式（多气泡最多2条）
+    """
+    if "OPENAI_API_KEY" not in st.secrets:
+        samples = {
+            "芙宁娜": ["哼，你忙完了吗？", "我可不是在等你……只是刚好想到你。"],
+            "胡桃": ["嘿嘿！我路过！", "你今天有没有发生什么离谱但好笑的事？"],
+            "宵宫": ["我突然想到你！", "今天过得怎么样？要不要来点轻松话题～"],
+        }
+        return samples.get(character, ["我来主动开个话题：你最近在忙啥？"])
+
+    system_prompt = build_system_prompt(character, "聊天")
+    messages = [{"role": "system", "content": system_prompt}]
+    for m in history[-10:]:
+        messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "user", "content": "请主动发起微信开场。仍按 JSON 数组输出，1-2条短消息。"})
+    raw = call_openai(messages, s_float("TEMP_CHAT", 1.05))
+    msgs = parse_chat_messages(raw)
+    return msgs[:2] if msgs else ["在吗？"]
+
+
+# =========================
+# 管理员后台（只有管理员能看到）
 # =========================
 if st.session_state.get("is_admin"):
     st.sidebar.divider()
@@ -694,11 +831,11 @@ if st.session_state.get("is_admin"):
             st.rerun()
 
     st.sidebar.markdown("#### AI 参数")
-    temp_chat = st.sidebar.slider("聊天温度 Temperature", 0.0, 1.5, float(s_float("TEMP_CHAT", 0.95)), 0.05)
-    temp_teach = st.sidebar.slider("教学温度 Temperature", 0.0, 1.5, float(s_float("TEMP_TEACH", 0.35)), 0.05)
+    temp_chat = st.sidebar.slider("聊天温度 Temperature", 0.0, 1.6, float(s_float("TEMP_CHAT", 1.05)), 0.05)
+    temp_teach = st.sidebar.slider("教学温度 Temperature", 0.0, 1.6, float(s_float("TEMP_TEACH", 0.35)), 0.05)
     top_p = st.sidebar.slider("top_p", 0.1, 1.0, float(s_float("TOP_P", 1.0)), 0.05)
-    presence = st.sidebar.slider("presence_penalty", -2.0, 2.0, float(s_float("PRESENCE_PENALTY", 0.6)), 0.1)
-    freq = st.sidebar.slider("frequency_penalty", -2.0, 2.0, float(s_float("FREQUENCY_PENALTY", 0.2)), 0.1)
+    presence = st.sidebar.slider("presence_penalty", -2.0, 2.0, float(s_float("PRESENCE_PENALTY", 0.7)), 0.1)
+    freq = st.sidebar.slider("frequency_penalty", -2.0, 2.0, float(s_float("FREQUENCY_PENALTY", 0.25)), 0.1)
 
     st.sidebar.markdown("#### Prompt（追加）")
     prompt_chat = st.sidebar.text_area("聊天模式追加 Prompt", value=SETTINGS.get("PROMPT_CHAT_EXTRA", ""), height=120)
@@ -711,7 +848,10 @@ if st.session_state.get("is_admin"):
     proactive_now = st.sidebar.button("让 TA 立刻主动说一句")
 
     st.sidebar.markdown("#### 时间分割条")
-    gran = st.sidebar.selectbox("时间分割粒度", ["minute", "5min"], index=0 if SETTINGS.get("TIME_DIVIDER_GRANULARITY", "minute") == "minute" else 1)
+    gran = st.sidebar.selectbox(
+        "时间分割粒度", ["minute", "5min"],
+        index=0 if SETTINGS.get("TIME_DIVIDER_GRANULARITY", "minute") == "minute" else 1
+    )
 
     if st.sidebar.button("保存以上设置", type="primary"):
         upsert_setting("TEMP_CHAT", str(temp_chat))
@@ -732,11 +872,61 @@ else:
 
 
 # =========================
-# 普通用户界面（更像微信）
+# 好友列表（微信样式：头像+名字+preview+未读点）
 # =========================
+def avatar_small_html(avatar):
+    if isinstance(avatar, str) and avatar.startswith("data:"):
+        return f'<div class="avatar"><img src="{avatar}"/></div>'
+    return f'<div class="avatar">{_html.escape(str(avatar))}</div>'
+
+
+def render_friend_item(character: str, active: bool):
+    meta = get_latest_message_meta(character)
+    pv = ""
+    if meta:
+        prefix = "你：" if meta.get("role") == "user" else ""
+        pv = prefix + preview_text(meta.get("content", ""), 22)
+
+    unread = get_unread_count(character)
+    avatar = avatar_for("assistant", character)
+
+    item_class = "wx-item active" if active else "wx-item"
+    badge_html = ""
+    if unread > 0 and (not active):
+        badge_html = f'<div class="unread-badge">{unread if unread < 100 else "99+"}</div>'
+
+    html_block = f"""
+    <div class="{item_class}">
+      {avatar_small_html(avatar)}
+      <div class="meta">
+        <div class="name">{_html.escape(character)}</div>
+        <div class="preview">{_html.escape(pv)}</div>
+      </div>
+      {badge_html}
+    </div>
+    """
+    return html_block
+
+
 st.sidebar.divider()
-st.sidebar.subheader("好友列表")
-character = st.sidebar.radio("选择聊天对象", list(CHARACTERS.keys()), label_visibility="collapsed")
+st.sidebar.markdown('<div class="sidebar-title">好友列表</div>', unsafe_allow_html=True)
+
+for ch in CHARACTERS.keys():
+    is_active = (st.session_state.selected_character == ch)
+    # 用 button 承接点击，但按钮隐藏样式，视觉由 HTML 渲染
+    if st.sidebar.button(" ", key=f"sel_{ch}", help=f"打开 {ch}", use_container_width=True):
+        st.session_state.selected_character = ch
+        # 切换到该聊天时，直接标记已读
+        mark_seen(ch)
+        st.rerun()
+
+    st.sidebar.markdown(render_friend_item(ch, is_active), unsafe_allow_html=True)
+
+
+# =========================
+# 顶部标题 + 模式切换（普通用户可见）
+# =========================
+character = st.session_state.selected_character
 
 colA, colB = st.columns([4, 1])
 with colA:
@@ -746,16 +936,20 @@ with colB:
     st.session_state.mode = mode
     st.markdown(f'<div class="wx-pill">模式：{mode}</div>', unsafe_allow_html=True)
 
+
+# =========================
+# 主动消息（管理员按钮 or 自动概率）
+# =========================
 history = load_messages(character)
 
-# 管理员点击“立刻主动”
 if proactive_now:
-    rate_limit(1.0, 300)
-    proactive_text = get_proactive_message(character, history)
-    save_message(character, "assistant", proactive_text)
+    rate_limit(1.0, 600)
+    msgs = get_proactive_message(character, history)
+    for m in msgs:
+        save_message(character, "assistant", m)
     st.rerun()
 
-# 自动主动（仅聊天模式）
+# 自动主动：只在聊天模式
 if st.session_state.mode == "聊天" and s_bool("PROACTIVE_ENABLED", True):
     last_key = f"last_proactive_ts_{character}"
     last_ts = st.session_state.get(last_key, 0.0)
@@ -765,11 +959,68 @@ if st.session_state.mode == "聊天" and s_bool("PROACTIVE_ENABLED", True):
     if now_ts - last_ts >= interval_min * 60:
         st.session_state[last_key] = now_ts
         if random.randint(1, 100) <= prob_pct:
-            proactive_text = get_proactive_message(character, history)
-            save_message(character, "assistant", proactive_text)
+            msgs = get_proactive_message(character, history)
+            for m in msgs:
+                save_message(character, "assistant", m)
+            # 不强制 rerun（避免抖动），但一般会 rerun
             st.rerun()
 
-# 渲染（A2：时间分割条 + A1：微信气泡）
+
+# =========================
+# “正在输入”延迟回复机制（关键）
+# =========================
+def start_pending_reply(character: str, mode: str):
+    delay = random.randint(1, 5)  # 1~5 秒
+    st.session_state.pending = {
+        "character": character,
+        "mode": mode,
+        "due_ts": time.time() + delay,
+    }
+
+
+def has_pending_for(character: str) -> bool:
+    p = st.session_state.get("pending")
+    return bool(p) and p.get("character") == character
+
+
+def maybe_finish_pending():
+    p = st.session_state.get("pending")
+    if not p:
+        return
+
+    if time.time() < float(p.get("due_ts", 0)):
+        return
+
+    ch = p.get("character")
+    mode = p.get("mode", "聊天")
+
+    # 拉最新 history（包含用户刚发的）
+    hist = load_messages(ch)
+
+    # 找到最后一条 user 作为触发（更稳）
+    last_user = None
+    for m in reversed(hist):
+        if m.get("role") == "user":
+            last_user = m.get("content", "")
+            break
+    if not last_user:
+        st.session_state.pending = None
+        return
+
+    rate_limit(1.0, 600)
+    replies = get_ai_reply(ch, hist, last_user, mode)
+    for r in replies:
+        save_message(ch, "assistant", r)
+
+    st.session_state.pending = None
+    st.rerun()
+
+
+# =========================
+# 渲染聊天区（含时间分割条）
+# =========================
+history = load_messages(character)
+
 st.markdown('<div class="wx-chat">', unsafe_allow_html=True)
 
 last_bucket = None
@@ -782,14 +1033,32 @@ for msg in history:
             last_bucket = bk
     render_message(msg["role"], character, msg["content"])
 
+# 如果当前角色有 pending，显示“正在输入…”
+if has_pending_for(character):
+    render_typing(character)
+
 st.markdown("</div>", unsafe_allow_html=True)
 
-# 输入
+# 打开此聊天即视为已读（避免未读点不消失）
+mark_seen(character)
+
+# 如果 pending 到点了，就生成回复
+maybe_finish_pending()
+
+# 如果还没到点，为了让“正在输入…”动起来 + 到点自动生成，做轻量轮询
+if has_pending_for(character):
+    time.sleep(0.35)
+    st.rerun()
+
+
+# =========================
+# 输入：用户发消息 -> 先入库 -> 启动 pending
+# =========================
 user_text = st.chat_input("输入消息…")
 if user_text:
     save_message(character, "user", user_text)
-    rate_limit()
-
-    reply = get_ai_reply(character, history, user_text, st.session_state.mode)
-    save_message(character, "assistant", reply)
+    # 立刻标记已读（你自己发的）
+    mark_seen(character)
+    # 启动延迟回复
+    start_pending_reply(character, st.session_state.mode)
     st.rerun()
