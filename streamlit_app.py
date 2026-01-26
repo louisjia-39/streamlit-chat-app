@@ -39,7 +39,8 @@ def require_gate():
     code_in = st.sidebar.text_input("输入访问码", type="password")
     admin_in = st.sidebar.text_input("管理员密钥（可选）", type="password")
 
-    submitted = st.sidebar.button("登录")  # 解决 iPad/移动端 Enter 不触发的问题
+    # 移动端 Enter 不一定触发 rerun，显式按钮最稳
+    submitted = st.sidebar.button("登录")
 
     if submitted:
         ok_weekly = bool(seed) and bool(code_in) and (code_in.strip().upper() == weekly_access_code(seed))
@@ -83,7 +84,7 @@ CHARACTERS = {
     "小周": "活泼、爱开玩笑、反应快",
 }
 
-# 没有设置头像时的默认（emoji）
+# 没设置头像图片时的默认（emoji）
 DEFAULT_AVATARS = {
     "user": "🙂",
     "小美": "🌸",
@@ -107,9 +108,10 @@ conn = st.connection("neon", type="sql")
 
 
 # =========================
-# DB：建表（chat_messages 你之前已建，这里只补头像表）
+# DB：建表（只补头像表）
 # =========================
 def ensure_tables():
+    # 注意：session.execute 必须用 text()
     q = text("""
         CREATE TABLE IF NOT EXISTS character_profiles (
             character TEXT PRIMARY KEY,
@@ -126,27 +128,19 @@ ensure_tables()
 
 
 # =========================
-# 头像：存取（data URL）
+# 头像：存取（data URL，持久化到 Neon）
 # =========================
-def get_avatars_from_db() -> dict:
-    """
-    返回：{ character: avatar_data_url }，没配置的角色不在字典里。
-    """
-    q = text("SELECT character, avatar_data_url FROM character_profiles;")
-    df = conn.query(q, ttl=0)
-    avatars = {}
-    for _, row in df.iterrows():
-        if row["avatar_data_url"]:
-            avatars[str(row["character"])] = str(row["avatar_data_url"])
-    return avatars
+def file_to_data_url(uploaded_file) -> str:
+    data = uploaded_file.getvalue()
+    if len(data) > 300 * 1024:  # 300KB
+        raise ValueError("图片太大，请上传 300KB 以内的图片（建议截图后再发）。")
+    mime = uploaded_file.type or "image/png"
+    b64 = base64.b64encode(data).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
 
 
 def upsert_avatar(character: str, avatar_data_url: str | None):
-    """
-    avatar_data_url:
-      - string（例如 data:image/png;base64,...）用于设置/更新
-      - None 表示清空
-    """
+    # session.execute 必须用 text()
     q = text("""
         INSERT INTO character_profiles (character, avatar_data_url)
         VALUES (:ch, :url)
@@ -159,35 +153,33 @@ def upsert_avatar(character: str, avatar_data_url: str | None):
         s.commit()
 
 
-def file_to_data_url(uploaded_file) -> str:
-    """
-    把上传的图片转成 data URL，便于直接作为 avatar 参数使用。
-    做一个大小限制（避免 DB 被塞爆）。
-    """
-    data = uploaded_file.getvalue()
-    if len(data) > 300 * 1024:  # 300KB
-        raise ValueError("图片太大，请上传 300KB 以内的图片（建议截图后再发）。")
-
-    mime = uploaded_file.type or "image/png"
-    b64 = base64.b64encode(data).decode("utf-8")
-    return f"data:{mime};base64,{b64}"
+def get_avatars_from_db() -> dict:
+    # conn.query 必须用字符串 SQL（不要 text()，避免 UnhashableParamError）
+    df = conn.query("SELECT character, avatar_data_url FROM character_profiles", ttl=0)
+    avatars = {}
+    for _, row in df.iterrows():
+        if row["avatar_data_url"]:
+            avatars[str(row["character"])] = str(row["avatar_data_url"])
+    return avatars
 
 
 # =========================
-# DB：聊天记录（全部用 text() 修复 ArgumentError）
+# DB：聊天记录
 # =========================
 def load_messages(character: str):
-    q = text("""
+    # conn.query 用字符串 SQL
+    q = """
         SELECT role, content
         FROM chat_messages
         WHERE session_id = :sid AND character = :ch
         ORDER BY created_at
-    """)
+    """
     df = conn.query(q, params={"sid": st.session_state.session_id, "ch": character}, ttl=0)
     return df.to_dict("records")
 
 
 def save_message(character: str, role: str, content: str):
+    # session.execute 必须用 text()
     q = text("""
         INSERT INTO chat_messages (session_id, character, role, content)
         VALUES (:sid, :ch, :role, :content)
@@ -205,6 +197,7 @@ def get_ai_reply(character: str, history: list[dict], user_text: str) -> str:
         return f"（测试模式）{character} 收到了：{user_text}"
 
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
     messages = [{
         "role": "system",
         "content": f"你在扮演{character}，性格是：{CHARACTERS[character]}。请用中文自然聊天，像真实朋友一样。",
@@ -232,6 +225,7 @@ def get_proactive_message(character: str, history: list[dict]) -> str:
         return f"（测试模式）{samples.get(character, '我来主动开个话题：你最近在忙啥？')}"
 
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
     messages = [{
         "role": "system",
         "content": f"你在扮演{character}，性格是：{CHARACTERS[character]}。你现在要主动开启一个轻松自然的话题，避免AI味，像真实聊天。",
@@ -253,19 +247,20 @@ def get_proactive_message(character: str, history: list[dict]) -> str:
 
 
 # =========================
-# 读取头像配置（每次 rerun 都会从 DB 读到最新配置）
+# 头像：根据 DB 配置决定每条消息的 avatar
 # =========================
 db_avatars = get_avatars_from_db()
 
-def avatar_for(role: str, character: str) -> str:
+
+def avatar_for(role: str, character: str):
     if role == "user":
         return DEFAULT_AVATARS["user"]
-    # assistant：优先 DB 配置，其次默认 emoji
+    # assistant：优先 DB 图像，其次默认 emoji
     return db_avatars.get(character, DEFAULT_AVATARS.get(character, "🤖"))
 
 
 # =========================
-# 管理员：头像管理面板（上传/清空）
+# 管理员：头像管理面板
 # =========================
 if st.session_state.get("is_admin"):
     st.sidebar.divider()
@@ -276,7 +271,6 @@ if st.session_state.get("is_admin"):
 
     if current:
         st.sidebar.caption("当前头像（预览）")
-        # st.image 支持 data url
         st.sidebar.image(current, width=64)
     else:
         st.sidebar.caption("当前头像：默认（未设置图片）")
@@ -337,7 +331,7 @@ if proactive_now:
     save_message(character, "assistant", proactive_text)
     st.rerun()
 
-# 自动主动（只会在页面有 rerun/交互时触发）
+# 自动主动（只在页面有 rerun/交互时触发）
 if auto_proactive:
     last_key = f"last_proactive_ts_{character}"
     last_ts = st.session_state.get(last_key, 0.0)
