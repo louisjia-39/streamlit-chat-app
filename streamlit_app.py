@@ -79,17 +79,17 @@ def rate_limit(min_interval_sec: float = 2.0, max_per_day: int = 200):
 st.set_page_config(page_title="多角色聊天", layout="wide")
 
 CHARACTERS = {
-    "小美": "温柔、会关心人、聊天自然",
-    "阿哲": "理性、冷静、喜欢分析问题",
-    "小周": "活泼、爱开玩笑、反应快",
+    "芙宁娜": "自尊心强、嘴硬、不轻易示弱、本质关心用户、不主动讨好",
+    "胡桃": "活泼、调皮、善良、偶尔吓人、爱开玩笑",
+    "宵宫": "热情、可靠、爱照顾人、工作认真、幽默",
 }
 
 # 没设置头像图片时的默认（emoji）
 DEFAULT_AVATARS = {
     "user": "🙂",
-    "小美": "🌸",
-    "阿哲": "🧠",
-    "小周": "⚡",
+    "芙宁娜": "🌸",
+    "胡桃": "🧠",
+    "宵宫": "⚡",
 }
 
 # 先门禁（在 DB / API 之前）
@@ -200,7 +200,7 @@ def get_ai_reply(character: str, history: list[dict], user_text: str) -> str:
 
     messages = [{
         "role": "system",
-        "content": f"你在扮演{character}，性格是：{CHARACTERS[character]}。请用中文自然聊天，像真实朋友一样。",
+        "content": f"你在扮演{character}，性格是：{CHARACTERS[character]}。请用中文自然聊天，像真实女朋友一样。",
     }]
 
     for m in history[-15:]:
@@ -218,9 +218,9 @@ def get_ai_reply(character: str, history: list[dict], user_text: str) -> str:
 def get_proactive_message(character: str, history: list[dict]) -> str:
     if "OPENAI_API_KEY" not in st.secrets:
         samples = {
-            "小美": "我刚刚想到一个问题：如果今晚只能做一件让你开心的事，你会选什么？",
-            "阿哲": "我想抛个小问题：你觉得“效率”和“幸福感”哪个更重要？为什么？",
-            "小周": "随机话题：你最近最上头的一首歌是什么？我去听听。",
+            "芙宁娜": "我刚刚想到一个问题：如果今晚只能做一件让你开心的事，你会选什么？",
+            "胡桃": "我想抛个小问题：你觉得“效率”和“幸福感”哪个更重要？为什么？",
+            "宵宫": "随机话题：你最近最上头的一首歌是什么？我去听听。",
         }
         return f"（测试模式）{samples.get(character, '我来主动开个话题：你最近在忙啥？')}"
 
