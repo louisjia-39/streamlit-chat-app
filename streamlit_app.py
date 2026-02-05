@@ -225,56 +225,65 @@ div[data-testid="stChatInput"]{
 
 
 # =========================
-# DB（Neon）
+# DB（Neon）— 延迟初始化：通过门禁后再连接，避免直接红屏
 # =========================
-conn = st.connection("neon", type="sql")
+conn = None
 
 
-def ensure_tables():
-    with conn.session as s:
-        s.execute(text("""
-            CREATE TABLE IF NOT EXISTS chat_messages (
-                id BIGSERIAL PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                character TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-        """))
-        s.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_chat_messages_session
-            ON chat_messages(session_id, character, created_at);
-        """))
-
-        s.execute(text("""
-            CREATE TABLE IF NOT EXISTS character_profiles (
-                character TEXT PRIMARY KEY,
-                avatar_data_url TEXT,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-        """))
-
-        s.execute(text("""
-            CREATE TABLE IF NOT EXISTS app_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-        """))
-
-        # 每周随机访问码（全局一份，不按 session）
-        s.execute(text("""
-            CREATE TABLE IF NOT EXISTS weekly_access_codes (
-                week_id TEXT PRIMARY KEY,
-                code TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-        """))
-        s.commit()
+def get_conn():
+    global conn
+    if conn is None:
+        conn = st.connection("neon", type="sql")
+    return conn
 
 
-ensure_tables()
+def ensure_tables_safe():
+    c = get_conn()
+    try:
+        with c.session as s:
+            s.execute(text("""
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id BIGSERIAL PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    character TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """))
+            s.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_chat_messages_session
+                ON chat_messages(session_id, character, created_at);
+            """))
+
+            s.execute(text("""
+                CREATE TABLE IF NOT EXISTS character_profiles (
+                    character TEXT PRIMARY KEY,
+                    avatar_data_url TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """))
+
+            s.execute(text("""
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """))
+
+            s.execute(text("""
+                CREATE TABLE IF NOT EXISTS weekly_access_codes (
+                    week_id TEXT PRIMARY KEY,
+                    code TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """))
+            s.commit()
+    except Exception as e:
+        st.error("数据库连接失败（Neon）。请打开右下角 Manage app → Logs 查看真实错误。")
+        st.exception(e)
+        st.stop()
 
 
 # =========================
@@ -305,7 +314,7 @@ def _gen_week_code(length: int = 8) -> str:
 
 
 def get_week_code_from_db(week_id: str) -> str | None:
-    df = conn.query(
+    df = get_conn().query(
         "SELECT code FROM weekly_access_codes WHERE week_id = :w LIMIT 1",
         params={"w": week_id},
         ttl=0
@@ -326,7 +335,7 @@ def ensure_week_code(week_id: str) -> str:
         VALUES (:w, :c)
         ON CONFLICT (week_id) DO NOTHING;
     """)
-    with conn.session as s:
+    with get_conn().session as s:
         s.execute(q, {"w": week_id, "c": new_code})
         s.commit()
 
@@ -334,7 +343,6 @@ def ensure_week_code(week_id: str) -> str:
 
 
 def reset_week_code(week_id: str) -> str:
-    """强制重置指定 week_id 的访问码（覆盖旧码）。返回新码。"""
     new_code = _gen_week_code(8)
     q = text("""
         INSERT INTO weekly_access_codes (week_id, code)
@@ -343,7 +351,7 @@ def reset_week_code(week_id: str) -> str:
         DO UPDATE SET code = EXCLUDED.code,
                       created_at = now();
     """)
-    with conn.session as s:
+    with get_conn().session as s:
         s.execute(q, {"w": week_id, "c": new_code})
         s.commit()
     return new_code
@@ -361,6 +369,7 @@ def require_gate():
         st.sidebar.error("缺少 ADMIN_KEY（请在 Secrets 配置管理员密码）。")
         st.stop()
 
+    # 注意：这里会访问 DB（取本周码）。如果你希望“门禁不依赖 DB”，我也可以给你改成纯本地 HMAC 方案。
     week_id = current_week_id()
     weekly_code = ensure_week_code(week_id)
 
@@ -403,6 +412,9 @@ def rate_limit(min_interval_sec: float = 1.4, max_per_day: int = 400):
 # 先门禁
 require_gate()
 
+# 通过门禁后再确保建表（避免“未登录就 DB 抖动红屏”）
+ensure_tables_safe()
+
 # session id
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
@@ -424,7 +436,7 @@ if "last_seen_ts" not in st.session_state:
 # 设置（Neon）
 # =========================
 def load_settings() -> dict:
-    df = conn.query("SELECT key, value FROM app_settings", ttl=0)
+    df = get_conn().query("SELECT key, value FROM app_settings", ttl=0)
     s = dict(DEFAULT_SETTINGS)
     for _, row in df.iterrows():
         s[str(row["key"])] = str(row["value"])
@@ -439,7 +451,7 @@ def upsert_setting(key: str, value: str):
         DO UPDATE SET value = EXCLUDED.value,
                       updated_at = now();
     """)
-    with conn.session as s:
+    with get_conn().session as s:
         s.execute(q, {"k": key, "v": value})
         s.commit()
 
@@ -554,13 +566,13 @@ def upsert_avatar(key_name: str, avatar_data_url: str | None):
         DO UPDATE SET avatar_data_url = EXCLUDED.avatar_data_url,
                       updated_at = now();
     """)
-    with conn.session as s:
+    with get_conn().session as s:
         s.execute(q, {"ch": key_name, "url": avatar_data_url})
         s.commit()
 
 
 def get_avatars_from_db() -> dict:
-    df = conn.query("SELECT character, avatar_data_url FROM character_profiles", ttl=0)
+    df = get_conn().query("SELECT character, avatar_data_url FROM character_profiles", ttl=0)
     avatars = {}
     for _, row in df.iterrows():
         if row["avatar_data_url"]:
@@ -587,7 +599,7 @@ def load_messages(character: str):
         WHERE session_id = :sid AND character = :ch
         ORDER BY created_at
     """
-    df = conn.query(q, params={"sid": st.session_state.session_id, "ch": character}, ttl=0)
+    df = get_conn().query(q, params={"sid": st.session_state.session_id, "ch": character}, ttl=0)
     recs = df.to_dict("records")
     for r in recs:
         ca = r.get("created_at")
@@ -604,7 +616,7 @@ def save_message(character: str, role: str, content: str):
         INSERT INTO chat_messages (session_id, character, role, content)
         VALUES (:sid, :ch, :role, :content)
     """)
-    with conn.session as s:
+    with get_conn().session as s:
         s.execute(q, {"sid": st.session_state.session_id, "ch": character, "role": role, "content": content})
         s.commit()
 
@@ -617,7 +629,7 @@ def get_latest_message_meta(character: str):
         ORDER BY created_at DESC
         LIMIT 1
     """
-    df = conn.query(q, params={"sid": st.session_state.session_id, "ch": character}, ttl=0)
+    df = get_conn().query(q, params={"sid": st.session_state.session_id, "ch": character}, ttl=0)
     if df.empty:
         return None
     row = df.iloc[0].to_dict()
