@@ -1,5 +1,6 @@
 streamlit
 openai
 sqlalchemy
+pandas
 pillow
 psycopg2-binary
