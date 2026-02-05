@@ -60,11 +60,13 @@ DEFAULT_SETTINGS = {
 
 # =========================
 # CSS：微信风格 + 好友列表 + 未读点 + 正在输入
+# ✅ 修复：不要隐藏 header，否则 iPad/手机端打不开 sidebar
 # =========================
 st.markdown(
     """
 <style>
-header[data-testid="stHeader"], div[data-testid="stToolbar"], footer { display:none !important; }
+/* ✅ 不隐藏 header（移动端需要左上角按钮打开侧边栏） */
+div[data-testid="stToolbar"], footer { display:none !important; }
 
 /* 背景更像微信 */
 .main { background:#ECE5DD; }
