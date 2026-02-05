@@ -2,9 +2,9 @@ import uuid
 import time
 import random
 import base64
-import hmac
-import hashlib
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 import io
 import html as _html
 import json
@@ -20,6 +20,8 @@ from PIL import Image
 # 配置
 # =========================
 st.set_page_config(page_title="聊天", layout="wide")
+
+LA_TZ = ZoneInfo("America/Los_Angeles")
 
 CHARACTERS = {
     "芙宁娜": "自尊心强、嘴硬、不轻易示弱、本质关心用户、不主动讨好",
@@ -96,11 +98,6 @@ section[data-testid="stSidebar"] { background:#F7F7F7; }
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
   margin-top:4px;
 }
-.unread-dot {
-  width:10px; height:10px; border-radius:999px;
-  background:#FF3B30;
-  box-shadow: 0 0 0 2px rgba(255,255,255,.9);
-}
 .unread-badge {
   min-width:18px; height:18px; padding:0 6px;
   border-radius:999px;
@@ -108,17 +105,6 @@ section[data-testid="stSidebar"] { background:#F7F7F7; }
   color:white;
   font-size:12px; line-height:18px;
   text-align:center;
-}
-
-/* 用按钮覆盖点击（隐藏原按钮样式） */
-div[data-testid="stSidebar"] button.friend-btn {
-  width: 100%;
-  padding: 0 !important;
-  border: none !important;
-  background: transparent !important;
-}
-div[data-testid="stSidebar"] button.friend-btn:hover {
-  background: transparent !important;
 }
 
 /* 主区域 */
@@ -237,36 +223,153 @@ div[data-testid="stChatInput"]{
 
 
 # =========================
-# 访问控制 / 每周密钥（A）
+# DB（Neon）
+# =========================
+conn = st.connection("neon", type="sql")
+
+
+def ensure_tables():
+    with conn.session as s:
+        s.execute(text("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id BIGSERIAL PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                character TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """))
+        s.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_session
+            ON chat_messages(session_id, character, created_at);
+        """))
+
+        s.execute(text("""
+            CREATE TABLE IF NOT EXISTS character_profiles (
+                character TEXT PRIMARY KEY,
+                avatar_data_url TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """))
+
+        s.execute(text("""
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """))
+
+        # 每周随机访问码（全局一份，不按 session）
+        s.execute(text("""
+            CREATE TABLE IF NOT EXISTS weekly_access_codes (
+                week_id TEXT PRIMARY KEY,
+                code TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """))
+        s.commit()
+
+
+ensure_tables()
+
+
+# =========================
+# 每周随机访问码（B）
 # =========================
 def current_week_id() -> str:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(LA_TZ)  # 按洛杉矶时间计算 ISO 周（周一切换）
     year, week, _ = now.isocalendar()
     return f"{year}-W{week:02d}"
 
 
-def weekly_access_code(seed: str) -> str:
-    msg = current_week_id().encode("utf-8")
-    digest = hmac.new(seed.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-    return digest[:8].upper()
+def week_id_from_dt(dt: datetime) -> str:
+    d = dt.astimezone(LA_TZ)
+    y, w, _ = d.isocalendar()
+    return f"{y}-W{w:02d}"
 
 
+def next_week_id() -> str:
+    now = datetime.now(LA_TZ)
+    thursday = now + timedelta(days=(3 - now.weekday()))
+    next_thursday = thursday + timedelta(days=7)
+    return week_id_from_dt(next_thursday)
+
+
+def _gen_week_code(length: int = 8) -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def get_week_code_from_db(week_id: str) -> str | None:
+    df = conn.query(
+        "SELECT code FROM weekly_access_codes WHERE week_id = :w LIMIT 1",
+        params={"w": week_id},
+        ttl=0
+    )
+    if df.empty:
+        return None
+    return str(df.iloc[0]["code"])
+
+
+def ensure_week_code(week_id: str) -> str:
+    code = get_week_code_from_db(week_id)
+    if code:
+        return code
+
+    new_code = _gen_week_code(8)
+    q = text("""
+        INSERT INTO weekly_access_codes (week_id, code)
+        VALUES (:w, :c)
+        ON CONFLICT (week_id) DO NOTHING;
+    """)
+    with conn.session as s:
+        s.execute(q, {"w": week_id, "c": new_code})
+        s.commit()
+
+    return get_week_code_from_db(week_id) or new_code
+
+
+def reset_week_code(week_id: str) -> str:
+    """强制重置指定 week_id 的访问码（覆盖旧码）。返回新码。"""
+    new_code = _gen_week_code(8)
+    q = text("""
+        INSERT INTO weekly_access_codes (week_id, code)
+        VALUES (:w, :c)
+        ON CONFLICT (week_id)
+        DO UPDATE SET code = EXCLUDED.code,
+                      created_at = now();
+    """)
+    with conn.session as s:
+        s.execute(q, {"w": week_id, "c": new_code})
+        s.commit()
+    return new_code
+
+
+# =========================
+# 访问控制（A：登录后不显示门禁区）
+# =========================
 def require_gate():
-    seed = st.secrets.get("ACCESS_SEED", "")
-    admin_key = st.secrets.get("ADMIN_KEY", "")
-
-    st.sidebar.subheader("访问控制")
-
     if st.session_state.get("authed"):
         return
 
-    code_in = st.sidebar.text_input("输入访问码", type="password")
+    admin_key = st.secrets.get("ADMIN_KEY", "")
+    if not admin_key:
+        st.sidebar.error("缺少 ADMIN_KEY（请在 Secrets 配置管理员密码）。")
+        st.stop()
+
+    week_id = current_week_id()
+    weekly_code = ensure_week_code(week_id)
+
+    st.sidebar.subheader("访问控制（每周更新）")
+    code_in = st.sidebar.text_input("输入本周访问码", type="password")
     admin_in = st.sidebar.text_input("管理员密钥（可选）", type="password")
-    submitted = st.sidebar.button("登录")
+    submitted = st.sidebar.button("登录", type="primary")
 
     if submitted:
-        ok_weekly = bool(seed) and bool(code_in) and (code_in.strip().upper() == weekly_access_code(seed))
-        ok_admin = bool(admin_key) and bool(admin_in) and (admin_in.strip() == admin_key)
+        ok_weekly = bool(code_in) and (code_in.strip().upper() == weekly_code.upper())
+        ok_admin = bool(admin_in) and (admin_in.strip() == admin_key)
 
         if ok_weekly or ok_admin:
             st.session_state.authed = True
@@ -275,7 +378,7 @@ def require_gate():
         else:
             st.sidebar.error("访问码或管理员密钥不正确。")
 
-    st.info("需要访问码才能使用。")
+    st.info("需要访问码才能使用（每周一自动刷新）。")
     st.stop()
 
 
@@ -316,49 +419,8 @@ if "last_seen_ts" not in st.session_state:
 
 
 # =========================
-# DB
+# 设置（Neon）
 # =========================
-conn = st.connection("neon", type="sql")
-
-
-def ensure_tables():
-    with conn.session as s:
-        s.execute(text("""
-            CREATE TABLE IF NOT EXISTS chat_messages (
-                id BIGSERIAL PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                character TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-        """))
-        s.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_chat_messages_session
-            ON chat_messages(session_id, character, created_at);
-        """))
-
-        s.execute(text("""
-            CREATE TABLE IF NOT EXISTS character_profiles (
-                character TEXT PRIMARY KEY,
-                avatar_data_url TEXT,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-        """))
-
-        s.execute(text("""
-            CREATE TABLE IF NOT EXISTS app_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-        """))
-        s.commit()
-
-
-ensure_tables()
-
-
 def load_settings() -> dict:
     df = conn.query("SELECT key, value FROM app_settings", ttl=0)
     s = dict(DEFAULT_SETTINGS)
@@ -435,7 +497,7 @@ def file_to_data_url(uploaded_file) -> str:
     except Exception:
         raise ValueError("无法识别图片格式，请上传 png/jpg/jpeg。")
 
-    # 旋转修正
+    # 旋转修正（EXIF）
     try:
         exif = img.getexif()
         orientation = exif.get(274)
@@ -567,13 +629,7 @@ def get_latest_message_meta(character: str):
 
 
 def get_unread_count(character: str) -> int:
-    """
-    未读定义：该角色最新一条 assistant 消息时间 > last_seen_ts[character]
-    由于我们每条消息都存 created_at，所以只算一条也可；这里做“粗略计数”：
-    统计 assistant 且 created_at > last_seen_ts
-    """
     last_seen = st.session_state.last_seen_ts.get(character, 0.0)
-    # last_seen 是 epoch 秒；SQL 用 now() 体系，直接用 created_at 比较不方便 -> 我们取全部后在 Python 数
     hist = load_messages(character)
     cnt = 0
     for m in hist:
@@ -607,17 +663,13 @@ def preview_text(s: str, n: int = 22) -> str:
 # =========================
 def fmt_time_label(dt: datetime) -> str:
     try:
-        local_dt = dt.astimezone()
+        local_dt = dt.astimezone(LA_TZ)
     except Exception:
         local_dt = dt
 
-    now = datetime.now(timezone.utc)
-    try:
-        now_local = now.astimezone()
-    except Exception:
-        now_local = now
+    now = datetime.now(LA_TZ)
 
-    if local_dt.date() == now_local.date():
+    if local_dt.date() == now.date():
         return local_dt.strftime("%H:%M")
     return local_dt.strftime("%m/%d %H:%M")
 
@@ -625,7 +677,7 @@ def fmt_time_label(dt: datetime) -> str:
 def bucket_key(dt: datetime) -> str:
     gran = SETTINGS.get("TIME_DIVIDER_GRANULARITY", "minute")
     try:
-        d = dt.astimezone()
+        d = dt.astimezone(LA_TZ)
     except Exception:
         d = dt
     if gran == "5min":
@@ -701,7 +753,6 @@ def build_system_prompt(character: str, mode: str) -> str:
         extra = SETTINGS.get("PROMPT_TEACH_EXTRA", "")
         return base_persona + "\n" + teach_core + ("\n" + extra if extra else "")
 
-    # 聊天模式：强制多气泡输出（JSON 数组）
     chat_core = (
         "你现在进入【聊天模式】。\n"
         "要求：像真实微信聊天，不要AI味；句子自然；可以有情绪；不要长篇论文；避免‘作为AI’。\n"
@@ -726,10 +777,6 @@ def call_openai(messages, temperature: float):
 
 
 def parse_chat_messages(raw: str) -> list[str]:
-    """
-    期望 raw 是 JSON 数组字符串。
-    兜底：按换行/分隔符拆，最多3条。
-    """
     raw = (raw or "").strip()
     try:
         arr = json.loads(raw)
@@ -744,7 +791,6 @@ def parse_chat_messages(raw: str) -> list[str]:
     except Exception:
         pass
 
-    # 兜底拆分
     parts = [p.strip() for p in re.split(r"\n+|---+|•|\u2022", raw) if p.strip()]
     return parts[:3]
 
@@ -763,10 +809,8 @@ def get_ai_reply(character: str, history: list[dict], user_text: str, mode: str)
     raw = call_openai(messages, temp)
 
     if mode == "教学":
-        # 教学模式：单条即可
         return [raw.strip()]
 
-    # 聊天模式：多气泡
     msgs = parse_chat_messages(raw)
     if not msgs:
         msgs = [raw.strip()] if raw.strip() else ["嗯？"]
@@ -774,9 +818,6 @@ def get_ai_reply(character: str, history: list[dict], user_text: str, mode: str)
 
 
 def get_proactive_message(character: str, history: list[dict]) -> list[str]:
-    """
-    主动消息也按聊天格式（多气泡最多2条）
-    """
     if "OPENAI_API_KEY" not in st.secrets:
         samples = {
             "芙宁娜": ["哼，你忙完了吗？", "我可不是在等你……只是刚好想到你。"],
@@ -796,18 +837,32 @@ def get_proactive_message(character: str, history: list[dict]) -> list[str]:
 
 
 # =========================
-# 管理员后台（只有管理员能看到）
+# 管理员后台（含：本周/下周码 + 重置本周码）
 # =========================
 if st.session_state.get("is_admin"):
     st.sidebar.divider()
     st.sidebar.subheader("管理员后台")
 
-    if "ACCESS_SEED" in st.secrets:
-        st.sidebar.success(f"本周访问码：{weekly_access_code(st.secrets['ACCESS_SEED'])}")
+    w_this = current_week_id()
+    w_next = next_week_id()
+    code_this = ensure_week_code(w_this)
+    code_next = ensure_week_code(w_next)
+
+    with st.sidebar.expander("访问码管理", expanded=True):
+        st.success(f"本周访问码（{w_this}）：{code_this}")
+        st.info(f"下周访问码（{w_next}）：{code_next}")
+
+        st.markdown("---")
+        st.warning("重置后：本周旧访问码立刻失效，新访客必须使用新码。")
+        confirm = st.checkbox("我确认要重置本周访问码", value=False)
+        if st.button("♻️ 重置本周访问码", type="primary", disabled=(not confirm)):
+            new_code = reset_week_code(w_this)
+            st.success(f"已重置！新的本周访问码：{new_code}")
+            st.rerun()
 
     st.sidebar.markdown("#### 头像管理（含 user）")
     target = st.sidebar.selectbox("选择要修改头像的对象", ["user"] + list(CHARACTERS.keys()))
-    cur = DB_AVATARS.get(target)
+    cur = get_avatars_from_db().get(target)
     if cur:
         st.sidebar.image(cur, width=72, caption="当前头像预览")
     else:
@@ -913,10 +968,8 @@ st.sidebar.markdown('<div class="sidebar-title">好友列表</div>', unsafe_allo
 
 for ch in CHARACTERS.keys():
     is_active = (st.session_state.selected_character == ch)
-    # 用 button 承接点击，但按钮隐藏样式，视觉由 HTML 渲染
     if st.sidebar.button(" ", key=f"sel_{ch}", help=f"打开 {ch}", use_container_width=True):
         st.session_state.selected_character = ch
-        # 切换到该聊天时，直接标记已读
         mark_seen(ch)
         st.rerun()
 
@@ -949,7 +1002,6 @@ if proactive_now:
         save_message(character, "assistant", m)
     st.rerun()
 
-# 自动主动：只在聊天模式
 if st.session_state.mode == "聊天" and s_bool("PROACTIVE_ENABLED", True):
     last_key = f"last_proactive_ts_{character}"
     last_ts = st.session_state.get(last_key, 0.0)
@@ -962,12 +1014,11 @@ if st.session_state.mode == "聊天" and s_bool("PROACTIVE_ENABLED", True):
             msgs = get_proactive_message(character, history)
             for m in msgs:
                 save_message(character, "assistant", m)
-            # 不强制 rerun（避免抖动），但一般会 rerun
             st.rerun()
 
 
 # =========================
-# “正在输入”延迟回复机制（关键）
+# “正在输入”延迟回复机制
 # =========================
 def start_pending_reply(character: str, mode: str):
     delay = random.randint(1, 5)  # 1~5 秒
@@ -987,17 +1038,14 @@ def maybe_finish_pending():
     p = st.session_state.get("pending")
     if not p:
         return
-
     if time.time() < float(p.get("due_ts", 0)):
         return
 
     ch = p.get("character")
     mode = p.get("mode", "聊天")
 
-    # 拉最新 history（包含用户刚发的）
     hist = load_messages(ch)
 
-    # 找到最后一条 user 作为触发（更稳）
     last_user = None
     for m in reversed(hist):
         if m.get("role") == "user":
@@ -1033,19 +1081,15 @@ for msg in history:
             last_bucket = bk
     render_message(msg["role"], character, msg["content"])
 
-# 如果当前角色有 pending，显示“正在输入…”
 if has_pending_for(character):
     render_typing(character)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-# 打开此聊天即视为已读（避免未读点不消失）
 mark_seen(character)
 
-# 如果 pending 到点了，就生成回复
 maybe_finish_pending()
 
-# 如果还没到点，为了让“正在输入…”动起来 + 到点自动生成，做轻量轮询
 if has_pending_for(character):
     time.sleep(0.35)
     st.rerun()
@@ -1057,8 +1101,6 @@ if has_pending_for(character):
 user_text = st.chat_input("输入消息…")
 if user_text:
     save_message(character, "user", user_text)
-    # 立刻标记已读（你自己发的）
     mark_seen(character)
-    # 启动延迟回复
     start_pending_reply(character, st.session_state.mode)
     st.rerun()
