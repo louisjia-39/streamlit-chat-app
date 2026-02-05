@@ -14,8 +14,10 @@ import re
 
 import streamlit as st
 from openai import OpenAI
-from sqlalchemy import text
+from sqlalchemy import text, create_engine
+from sqlalchemy.orm import sessionmaker
 from PIL import Image
+import pandas as pd
 
 
 # =========================
@@ -29,12 +31,15 @@ CHARACTERS = {
     "胡桃": "活泼、调皮、善良、偶尔吓人、爱开玩笑",
     "宵宫": "热情、可靠、爱照顾人、工作认真、幽默",
 }
+GROUP_CHAT = "群聊"
+GROUP_MEMBERS = ["芙宁娜", "胡桃", "宵宫"]
 
 DEFAULT_AVATARS = {
     "user": "🙂",
     "芙宁娜": "👑",
     "胡桃": "🦋",
     "宵宫": "🎆",
+    "群聊": "👥",
 }
 
 DEFAULT_SETTINGS = {
@@ -179,6 +184,15 @@ section[data-testid="stSidebar"] { background:#F7F7F7; }
   border-top:6px solid transparent; border-bottom:6px solid transparent;
   border-left:7px solid #95EC69;
 }
+.wx-name {
+  font-size:12px;
+  color: rgba(0,0,0,.55);
+  margin: 0 0 2px 6px;
+}
+.wx-name.user {
+  text-align: right;
+  margin: 0 6px 2px 0;
+}
 
 /* 输入框贴底 */
 div[data-testid="stChatInput"]{
@@ -244,24 +258,46 @@ def weekly_code_hmac(seed: str, week_id: str) -> str:
 conn = None
 
 
+class LocalSQLiteConnection:
+    def __init__(self, db_path: str):
+        self.engine = create_engine(f"sqlite:///{db_path}", future=True)
+        self._session_maker = sessionmaker(bind=self.engine, future=True)
+
+    @property
+    def session(self):
+        return self._session_maker()
+
+    def query(self, sql: str, params: dict | None = None, ttl: int = 0):
+        with self.engine.connect() as conn:
+            return pd.read_sql(text(sql), conn, params=params)
+
+
 def get_conn():
     global conn
     if conn is None:
-        conn = st.connection("neon", type="sql")
+        try:
+            conn = st.connection("neon", type="sql")
+        except Exception:
+            st.warning("未检测到数据库连接配置，已切换到本地 SQLite（仅当前环境生效）。")
+            conn = LocalSQLiteConnection("local_chat.db")
     return conn
 
 
 def ensure_tables_safe():
     c = get_conn()
+    is_sqlite = isinstance(c, LocalSQLiteConnection)
+    id_type = "INTEGER PRIMARY KEY AUTOINCREMENT" if is_sqlite else "BIGSERIAL PRIMARY KEY"
+    ts_type = "TIMESTAMP" if is_sqlite else "TIMESTAMPTZ"
+    ts_default = "CURRENT_TIMESTAMP"
     with c.session as s:
-        s.execute(text("""
+        s.execute(text(f"""
             CREATE TABLE IF NOT EXISTS chat_messages (
-                id BIGSERIAL PRIMARY KEY,
+                id {id_type},
                 session_id TEXT NOT NULL,
                 character TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                created_at {ts_type} NOT NULL DEFAULT {ts_default}
             );
         """))
         s.execute(text("""
@@ -269,28 +305,42 @@ def ensure_tables_safe():
             ON chat_messages(session_id, character, created_at);
         """))
 
-        s.execute(text("""
+        s.execute(text(f"""
             CREATE TABLE IF NOT EXISTS character_profiles (
                 character TEXT PRIMARY KEY,
                 avatar_data_url TEXT,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                updated_at {ts_type} NOT NULL DEFAULT {ts_default}
             );
         """))
 
-        s.execute(text("""
+        s.execute(text(f"""
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                updated_at {ts_type} NOT NULL DEFAULT {ts_default}
             );
+        """))
+        s.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS group_messages (
+                id {id_type},
+                session_id TEXT NOT NULL,
+                speaker TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at {ts_type} NOT NULL DEFAULT {ts_default}
+            );
+        """))
+        s.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_group_messages_session
+            ON group_messages(session_id, created_at);
         """))
 
         # 管理员重置本周码 override（可选）
-        s.execute(text("""
+        s.execute(text(f"""
             CREATE TABLE IF NOT EXISTS weekly_access_overrides (
                 week_id TEXT PRIMARY KEY,
                 code TEXT NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                updated_at {ts_type} NOT NULL DEFAULT {ts_default}
             );
         """))
         s.commit()
@@ -317,7 +367,7 @@ def reset_override_code_db(week_id: str) -> str:
         VALUES (:w, :c)
         ON CONFLICT (week_id)
         DO UPDATE SET code = EXCLUDED.code,
-                      updated_at = now();
+                      updated_at = CURRENT_TIMESTAMP;
     """)
     with get_conn().session as s:
         s.execute(q, {"w": week_id, "c": new_code})
@@ -437,6 +487,9 @@ if "selected_character" not in st.session_state:
 # 未读
 if "last_seen_ts" not in st.session_state:
     st.session_state.last_seen_ts = {ch: 0.0 for ch in CHARACTERS.keys()}
+    st.session_state.last_seen_ts[GROUP_CHAT] = 0.0
+if GROUP_CHAT not in st.session_state.last_seen_ts:
+    st.session_state.last_seen_ts[GROUP_CHAT] = 0.0
 
 
 # =========================
@@ -456,7 +509,7 @@ def upsert_setting(key: str, value: str):
         VALUES (:k, :v)
         ON CONFLICT (key)
         DO UPDATE SET value = EXCLUDED.value,
-                      updated_at = now();
+                      updated_at = CURRENT_TIMESTAMP;
     """)
     with get_conn().session as s:
         s.execute(q, {"k": key, "v": value})
@@ -567,7 +620,7 @@ def upsert_avatar(key_name: str, avatar_data_url: str | None):
         VALUES (:ch, :url)
         ON CONFLICT (character)
         DO UPDATE SET avatar_data_url = EXCLUDED.avatar_data_url,
-                      updated_at = now();
+                      updated_at = CURRENT_TIMESTAMP;
     """)
     with get_conn().session as s:
         s.execute(q, {"ch": key_name, "url": avatar_data_url})
@@ -674,6 +727,82 @@ def preview_text(s: str, n: int = 22) -> str:
 
 
 # =========================
+# 群聊：消息读写
+# =========================
+def load_group_messages():
+    q = """
+        SELECT id, speaker, role, content, created_at
+        FROM group_messages
+        WHERE session_id = :sid
+        ORDER BY created_at
+    """
+    df = get_conn().query(q, params={"sid": st.session_state.session_id}, ttl=0)
+    recs = df.to_dict("records")
+    for r in recs:
+        ca = r.get("created_at")
+        if isinstance(ca, str):
+            try:
+                r["created_at"] = datetime.fromisoformat(ca.replace("Z", "+00:00"))
+            except Exception:
+                r["created_at"] = None
+    return recs
+
+
+def save_group_message(speaker: str, role: str, content: str):
+    q = text("""
+        INSERT INTO group_messages (session_id, speaker, role, content)
+        VALUES (:sid, :sp, :role, :content)
+    """)
+    with get_conn().session as s:
+        s.execute(q, {"sid": st.session_state.session_id, "sp": speaker, "role": role, "content": content})
+        s.commit()
+
+
+def get_group_latest_message_meta():
+    q = """
+        SELECT id, speaker, role, content, created_at
+        FROM group_messages
+        WHERE session_id = :sid
+        ORDER BY created_at DESC
+        LIMIT 1
+    """
+    df = get_conn().query(q, params={"sid": st.session_state.session_id}, ttl=0)
+    if df.empty:
+        return None
+    row = df.iloc[0].to_dict()
+    ca = row.get("created_at")
+    if isinstance(ca, str):
+        try:
+            row["created_at"] = datetime.fromisoformat(ca.replace("Z", "+00:00"))
+        except Exception:
+            row["created_at"] = None
+    return row
+
+
+def get_group_unread_count() -> int:
+    last_seen = st.session_state.last_seen_ts.get(GROUP_CHAT, 0.0)
+    hist = load_group_messages()
+    cnt = 0
+    for m in hist:
+        if m.get("role") == "assistant" and isinstance(m.get("created_at"), datetime):
+            ts = m["created_at"].timestamp()
+            if ts > last_seen:
+                cnt += 1
+    return cnt
+
+
+def mark_group_seen():
+    hist = load_group_messages()
+    latest_ts = 0.0
+    for m in hist[::-1]:
+        dt = m.get("created_at")
+        if isinstance(dt, datetime):
+            latest_ts = dt.timestamp()
+            break
+    st.session_state.last_seen_ts[GROUP_CHAT] = max(st.session_state.last_seen_ts.get(GROUP_CHAT, 0.0), latest_ts)
+
+
+# =========================
 # 时间分割条
 # =========================
 def fmt_time_label(dt: datetime) -> str:
@@ -730,6 +859,35 @@ def render_message(role: str, character: str, content: str):
         <div class="wx-row bot">
             {_avatar_html(avatar)}
             <div class="wx-bubble bot">{safe_text}</div>
+        </div>
+        """
+    st.markdown(html_block, unsafe_allow_html=True)
+
+
+def render_group_message(role: str, speaker: str, content: str):
+    is_user = (role == "user")
+    avatar = avatar_for("user" if is_user else "assistant", speaker)
+    safe_text = _html.escape(content).replace("\n", "<br>")
+    safe_name = "你" if is_user else _html.escape(speaker)
+
+    if is_user:
+        html_block = f"""
+        <div class="wx-row user">
+            <div>
+                <div class="wx-name user">{safe_name}</div>
+                <div class="wx-bubble user">{safe_text}</div>
+            </div>
+            {_avatar_html(avatar)}
+        </div>
+        """
+    else:
+        html_block = f"""
+        <div class="wx-row bot">
+            {_avatar_html(avatar)}
+            <div>
+                <div class="wx-name">{safe_name}</div>
+                <div class="wx-bubble bot">{safe_text}</div>
+            </div>
         </div>
         """
     st.markdown(html_block, unsafe_allow_html=True)
@@ -820,6 +978,54 @@ def get_ai_reply(character: str, history: list[dict], user_text: str, mode: str)
 
     msgs = parse_chat_messages(raw)
     return msgs if msgs else [raw.strip() or "嗯？"]
+
+
+def build_group_system_prompt(character: str) -> str:
+    base = build_system_prompt(character, "聊天")
+    group_hint = (
+        "\n你在一个群聊里，成员有：芙宁娜、胡桃、宵宫、用户。"
+        f"你是{character}，只代表自己发言，不要替别人说话。"
+        "回复仍按 JSON 数组输出。"
+    )
+    return base + group_hint
+
+
+def get_group_ai_reply(character: str, history: list[dict]) -> list[str]:
+    if "OPENAI_API_KEY" not in st.secrets:
+        return [f"（测试模式）{character} 说：收到~"]
+
+    system_prompt = build_group_system_prompt(character)
+    messages = [{"role": "system", "content": system_prompt}]
+    for m in history[-20:]:
+        speaker = m.get("speaker", "")
+        content = m.get("content", "")
+        if speaker == "user":
+            messages.append({"role": "user", "content": content})
+        else:
+            messages.append({"role": "assistant", "content": f"{speaker}：{content}"})
+    messages.append({"role": "user", "content": "请在群聊中回复上一条消息。"})
+
+    raw = call_openai(messages, s_float("TEMP_CHAT", 1.05))
+    msgs = parse_chat_messages(raw)
+    return msgs if msgs else [raw.strip() or "嗯？"]
+
+
+def get_group_proactive_message(character: str, history: list[dict]) -> list[str]:
+    if "OPENAI_API_KEY" not in st.secrets:
+        return [f"（测试模式）{character} 先说一句。"]
+    system_prompt = build_group_system_prompt(character)
+    messages = [{"role": "system", "content": system_prompt}]
+    for m in history[-12:]:
+        speaker = m.get("speaker", "")
+        content = m.get("content", "")
+        if speaker == "user":
+            messages.append({"role": "user", "content": content})
+        else:
+            messages.append({"role": "assistant", "content": f"{speaker}：{content}"})
+    messages.append({"role": "user", "content": "请你在群聊里先开个话题，1-2条短消息。"})
+    raw = call_openai(messages, s_float("TEMP_CHAT", 1.05))
+    msgs = parse_chat_messages(raw)
+    return msgs[:2] if msgs else ["在吗？"]
 
 
 def get_proactive_message(character: str, history: list[dict]) -> list[str]:
@@ -967,13 +1173,49 @@ def render_friend_item(character: str, active: bool):
     return html_block
 
 
+def render_group_item(active: bool):
+    meta = get_group_latest_message_meta()
+    pv = ""
+    if meta:
+        speaker = meta.get("speaker", "")
+        prefix = "你：" if speaker == "user" else f"{speaker}："
+        pv = prefix + preview_text(meta.get("content", ""), 22)
+    unread = get_group_unread_count()
+    avatar = DEFAULT_AVATARS.get(GROUP_CHAT, "👥")
+    item_class = "wx-item active" if active else "wx-item"
+    badge_html = ""
+    if unread > 0 and (not active):
+        badge_html = f'<div class="unread-badge">{unread if unread < 100 else "99+"}</div>'
+    html_block = f"""
+    <div class="{item_class}">
+      {avatar_small_html(avatar)}
+      <div class="meta">
+        <div class="name">{GROUP_CHAT}</div>
+        <div class="preview">{_html.escape(pv)}</div>
+      </div>
+      {badge_html}
+    </div>
+    """
+    return html_block
+
+
 st.sidebar.divider()
 st.sidebar.markdown('<div class="sidebar-title">好友列表</div>', unsafe_allow_html=True)
+
+is_group_active = (st.session_state.selected_character == GROUP_CHAT)
+if st.sidebar.button(" ", key="sel_group", help="打开 群聊", use_container_width=True):
+    st.session_state.selected_character = GROUP_CHAT
+    st.session_state.mode = GROUP_CHAT
+    mark_group_seen()
+    st.rerun()
+st.sidebar.markdown(render_group_item(is_group_active), unsafe_allow_html=True)
 
 for ch in CHARACTERS.keys():
     is_active = (st.session_state.selected_character == ch)
     if st.sidebar.button(" ", key=f"sel_{ch}", help=f"打开 {ch}", use_container_width=True):
         st.session_state.selected_character = ch
+        if st.session_state.mode == GROUP_CHAT:
+            st.session_state.mode = "聊天"
         mark_seen(ch)
         st.rerun()
     st.sidebar.markdown(render_friend_item(ch, is_active), unsafe_allow_html=True)
@@ -986,26 +1228,41 @@ character = st.session_state.selected_character
 
 colA, colB = st.columns([4, 1])
 with colA:
-    st.markdown(f'<div class="wx-title">正在和「{character}」聊天</div>', unsafe_allow_html=True)
+    if character == GROUP_CHAT or st.session_state.mode == GROUP_CHAT:
+        st.markdown(f'<div class="wx-title">正在和「{GROUP_CHAT}」聊天</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="wx-title">正在和「{character}」聊天</div>', unsafe_allow_html=True)
 with colB:
-    mode = st.selectbox("模式", ["聊天", "教学"], index=0 if st.session_state.mode == "聊天" else 1)
+    mode_options = ["聊天", "教学", GROUP_CHAT]
+    current_mode = st.session_state.mode if st.session_state.mode in mode_options else "聊天"
+    mode = st.selectbox("模式", mode_options, index=mode_options.index(current_mode))
     st.session_state.mode = mode
     st.markdown(f'<div class="wx-pill">模式：{mode}</div>', unsafe_allow_html=True)
+
+if st.session_state.mode == GROUP_CHAT:
+    st.session_state.selected_character = GROUP_CHAT
+    character = GROUP_CHAT
+elif st.session_state.selected_character == GROUP_CHAT:
+    st.session_state.mode = GROUP_CHAT
+    character = GROUP_CHAT
 
 
 # =========================
 # 主动消息（管理员按钮 or 自动概率）
 # =========================
-history = load_messages(character)
+if character == GROUP_CHAT:
+    history = load_group_messages()
+else:
+    history = load_messages(character)
 
-if proactive_now:
+if character != GROUP_CHAT and proactive_now:
     rate_limit(1.0, 600)
     msgs = get_proactive_message(character, history)
     for m in msgs:
         save_message(character, "assistant", m)
     st.rerun()
 
-if st.session_state.mode == "聊天" and s_bool("PROACTIVE_ENABLED", True):
+if character != GROUP_CHAT and st.session_state.mode == "聊天" and s_bool("PROACTIVE_ENABLED", True):
     last_key = f"last_proactive_ts_{character}"
     last_ts = st.session_state.get(last_key, 0.0)
     now_ts = time.time()
@@ -1065,7 +1322,10 @@ def maybe_finish_pending():
 # =========================
 # 渲染聊天区
 # =========================
-history = load_messages(character)
+if character == GROUP_CHAT:
+    history = load_group_messages()
+else:
+    history = load_messages(character)
 
 st.markdown('<div class="wx-chat">', unsafe_allow_html=True)
 
@@ -1077,17 +1337,23 @@ for msg in history:
         if bk != last_bucket:
             render_time_divider(fmt_time_label(dt))
             last_bucket = bk
-    render_message(msg["role"], character, msg["content"])
+    if character == GROUP_CHAT:
+        render_group_message(msg.get("role", "assistant"), msg.get("speaker", ""), msg.get("content", ""))
+    else:
+        render_message(msg["role"], character, msg["content"])
 
-if has_pending_for(character):
+if character != GROUP_CHAT and has_pending_for(character):
     render_typing(character)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-mark_seen(character)
-maybe_finish_pending()
+if character == GROUP_CHAT:
+    mark_group_seen()
+else:
+    mark_seen(character)
+    maybe_finish_pending()
 
-if has_pending_for(character):
+if character != GROUP_CHAT and has_pending_for(character):
     time.sleep(0.35)
     st.rerun()
 
@@ -1097,7 +1363,38 @@ if has_pending_for(character):
 # =========================
 user_text = st.chat_input("输入消息…")
 if user_text:
-    save_message(character, "user", user_text)
-    mark_seen(character)
-    start_pending_reply(character, st.session_state.mode)
-    st.rerun()
+    if character == GROUP_CHAT:
+        rate_limit(1.0, 600)
+        save_group_message("user", "user", user_text)
+        mark_group_seen()
+        history = load_group_messages()
+        responders = GROUP_MEMBERS
+        for responder in responders:
+            replies = get_group_ai_reply(responder, history)
+            for r in replies:
+                save_group_message(responder, "assistant", r)
+            history = load_group_messages()
+        st.rerun()
+    else:
+        save_message(character, "user", user_text)
+        mark_seen(character)
+        start_pending_reply(character, st.session_state.mode)
+        st.rerun()
+
+if character == GROUP_CHAT:
+    st.caption("群聊小工具：让随机角色先开口，其他人会跟进回复。")
+    if st.button("🎲 随机角色先开口", use_container_width=True):
+        rate_limit(1.0, 600)
+        history = load_group_messages()
+        starter = random.choice(GROUP_MEMBERS)
+        starter_msgs = get_group_proactive_message(starter, history)
+        for m in starter_msgs:
+            save_group_message(starter, "assistant", m)
+        history = load_group_messages()
+        responders = [ch for ch in GROUP_MEMBERS if ch != starter]
+        for responder in responders:
+            replies = get_group_ai_reply(responder, history)
+            for r in replies:
+                save_group_message(responder, "assistant", r)
+            history = load_group_messages()
+        st.rerun()
