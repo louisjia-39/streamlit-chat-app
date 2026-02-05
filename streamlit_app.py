@@ -53,16 +53,20 @@ DEFAULT_SETTINGS = {
 
 
 # =========================
-# CSS（✅ 不隐藏 header：iPad/手机端需要它打开 sidebar）
+# CSS：微信风格（✅ 不隐藏 header，iPad/手机端需要打开 sidebar）
 # =========================
 st.markdown(
     """
 <style>
 div[data-testid="stToolbar"], footer { display:none !important; }
-.main { background:#ECE5DD; }
-section[data-testid="stSidebar"] { background:#F7F7F7; }
 
+/* 背景更像微信 */
+.main { background:#ECE5DD; }
+
+/* Sidebar */
+section[data-testid="stSidebar"] { background:#F7F7F7; }
 .sidebar-title { font-size:18px; font-weight:700; margin: 6px 0 10px 0; }
+
 .wx-item {
   display:flex; gap:10px; align-items:center;
   padding:10px 10px;
@@ -97,15 +101,29 @@ section[data-testid="stSidebar"] { background:#F7F7F7; }
   text-align:center;
 }
 
-.wx-title { font-size: 30px; font-weight: 800; margin: 10px 0 6px 0; }
+/* 主区域 */
+.wx-title {
+  font-size: 30px; font-weight: 800;
+  margin: 10px 0 6px 0;
+}
 .wx-pill {
-  display:inline-block; padding: 6px 10px; border-radius: 999px;
+  display:inline-block;
+  padding: 6px 10px;
+  border-radius: 999px;
   background: rgba(255,255,255,.75);
   border: 1px solid rgba(0,0,0,.06);
   font-size: 13px;
 }
-.wx-chat { width:100%; max-width: 940px; margin:0 auto; padding: 6px 10px 0 10px; }
 
+/* 聊天容器 */
+.wx-chat {
+  width:100%;
+  max-width: 940px;
+  margin:0 auto;
+  padding: 6px 10px 0 10px;
+}
+
+/* 时间分割条 */
 .wx-time { width:100%; display:flex; justify-content:center; margin:10px 0 8px 0; }
 .wx-time span {
   font-size:12px; color: rgba(0,0,0,.55);
@@ -115,10 +133,12 @@ section[data-testid="stSidebar"] { background:#F7F7F7; }
   padding: 4px 10px;
 }
 
+/* 消息行 */
 .wx-row { display:flex; gap:8px; margin:6px 0; align-items:flex-start; }
 .wx-row.bot { justify-content:flex-start; }
 .wx-row.user { justify-content:flex-end; }
 
+/* 头像 */
 .wx-avatar {
   width:40px; height:40px; border-radius:10px; overflow:hidden;
   background: rgba(0,0,0,.06);
@@ -128,6 +148,7 @@ section[data-testid="stSidebar"] { background:#F7F7F7; }
 }
 .wx-avatar img { width:100%; height:100%; object-fit:cover; }
 
+/* 气泡 */
 .wx-bubble {
   max-width: min(72%, 620px);
   padding: 9px 12px;
@@ -142,6 +163,7 @@ section[data-testid="stSidebar"] { background:#F7F7F7; }
 .wx-bubble.bot { background:#FFFFFF; border:1px solid rgba(0,0,0,.06); }
 .wx-bubble.user { background:#95EC69; border:1px solid rgba(0,0,0,.03); }
 
+/* 尖角 */
 .wx-bubble.bot:before {
   content:""; position:absolute; left:-6px; top:12px; width:0; height:0;
   border-top:6px solid transparent; border-bottom:6px solid transparent;
@@ -158,6 +180,7 @@ section[data-testid="stSidebar"] { background:#F7F7F7; }
   border-left:7px solid #95EC69;
 }
 
+/* 输入框贴底 */
 div[data-testid="stChatInput"]{
   position: sticky;
   bottom: 0;
@@ -167,9 +190,15 @@ div[data-testid="stChatInput"]{
   z-index: 10;
 }
 
-.typing { display:flex; gap:6px; align-items:center; color: rgba(0,0,0,.55); font-size: 14px; }
+/* 正在输入… */
+.typing {
+  display:flex; gap:6px; align-items:center;
+  color: rgba(0,0,0,.55);
+  font-size: 14px;
+}
 .dots span{
-  display:inline-block; width:6px; height:6px; border-radius:99px;
+  display:inline-block;
+  width:6px; height:6px; border-radius:99px;
   background: rgba(0,0,0,.35);
   margin-right:3px;
   animation: blink 1s infinite;
@@ -187,7 +216,7 @@ div[data-testid="stChatInput"]{
 
 
 # =========================
-# 工具：时间与周
+# 周工具
 # =========================
 def current_week_id() -> str:
     now = datetime.now(LA_TZ)
@@ -196,15 +225,13 @@ def current_week_id() -> str:
 
 
 def next_week_id() -> str:
-    now = datetime.now(LA_TZ)
-    # 下周同一时刻
-    d = now + timedelta(days=7)
+    d = datetime.now(LA_TZ) + timedelta(days=7)
     y, w, _ = d.isocalendar()
     return f"{y}-W{w:02d}"
 
 
 # =========================
-# 访问码（✅ 门禁不依赖 DB）
+# 访问码：默认 HMAC（不依赖 DB）
 # =========================
 def weekly_code_hmac(seed: str, week_id: str) -> str:
     digest = hmac.new(seed.encode("utf-8"), week_id.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -212,7 +239,7 @@ def weekly_code_hmac(seed: str, week_id: str) -> str:
 
 
 # =========================
-# DB：延迟初始化（DB 只用于聊天记录/设置/头像/可选重置访问码）
+# DB：延迟初始化（登录后才连）
 # =========================
 conn = None
 
@@ -225,9 +252,6 @@ def get_conn():
 
 
 def ensure_tables_safe():
-    """
-    DB 建表只在登录后做。DB 如果挂了，不要影响门禁。
-    """
     c = get_conn()
     with c.session as s:
         s.execute(text("""
@@ -261,7 +285,7 @@ def ensure_tables_safe():
             );
         """))
 
-        # 可选：管理员重置本周访问码 override（依赖 DB）
+        # 管理员重置本周码 override（可选）
         s.execute(text("""
             CREATE TABLE IF NOT EXISTS weekly_access_overrides (
                 week_id TEXT PRIMARY KEY,
@@ -302,19 +326,12 @@ def reset_override_code_db(week_id: str) -> str:
 
 
 def effective_weekly_code(seed: str, week_id: str) -> str:
-    """
-    最终访问码：
-    - 有 DB override 就用 override
-    - 否则用 HMAC 周码（不依赖 DB）
-    """
     ov = get_override_code_db(week_id)
-    if ov:
-        return ov
-    return weekly_code_hmac(seed, week_id)
+    return ov if ov else weekly_code_hmac(seed, week_id)
 
 
 # =========================
-# 门禁：不依赖 DB（✅）
+# 门禁：主页面 + sidebar 都能输入（✅ 修复 iPad 看不到输入框）
 # =========================
 def require_gate():
     if st.session_state.get("authed"):
@@ -324,32 +341,56 @@ def require_gate():
     admin_key = st.secrets.get("ADMIN_KEY", "")
 
     if not seed:
-        st.sidebar.error("缺少 ACCESS_SEED（请在 Secrets 里配置）。")
+        st.error("缺少 ACCESS_SEED（请在 Secrets 里配置）。")
         st.stop()
     if not admin_key:
-        st.sidebar.error("缺少 ADMIN_KEY（请在 Secrets 里配置管理员密码）。")
+        st.error("缺少 ADMIN_KEY（请在 Secrets 里配置管理员密码）。")
         st.stop()
 
     week_id = current_week_id()
-    weekly_code = effective_weekly_code(seed, week_id)
+    weekly_code = weekly_code_hmac(seed, week_id)  # ✅ 门禁阶段不读 DB（保证一定能显示输入框）
 
+    # ---- Sidebar（可选） ----
     st.sidebar.subheader("访问控制（每周更新）")
-    code_in = st.sidebar.text_input("输入本周访问码", type="password")
-    admin_in = st.sidebar.text_input("管理员密钥（可选）", type="password")
-    submitted = st.sidebar.button("登录", type="primary")
+    code_in_sb = st.sidebar.text_input("输入本周访问码", type="password", key="gate_code_sb")
+    admin_in_sb = st.sidebar.text_input("管理员密钥（可选）", type="password", key="gate_admin_sb")
+    submitted_sb = st.sidebar.button("登录", type="primary", key="gate_submit_sb")
 
-    if submitted:
-        ok_weekly = bool(code_in) and (code_in.strip().upper() == weekly_code.upper())
-        ok_admin = bool(admin_in) and (admin_in.strip() == admin_key)
+    # ---- Main（关键：iPad/手机可见） ----
+    st.markdown(
+        """
+        <div style="max-width:680px;margin:40px auto 0 auto;
+                    padding:18px 18px;border-radius:14px;
+                    background:rgba(255,255,255,.75);
+                    border:1px solid rgba(0,0,0,.06);">
+          <div style="font-size:18px;font-weight:800;margin-bottom:8px;">需要访问码才能使用（每周一自动刷新）</div>
+          <div style="font-size:13px;color:rgba(0,0,0,.55);margin-bottom:12px;">
+            iPad/手机如果看不到侧边栏，请直接在这里登录（不用打开 sidebar）。
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.form("gate_form_main", clear_on_submit=False):
+        code_in = st.text_input("本周访问码", type="password", key="gate_code_main")
+        admin_in = st.text_input("管理员密钥（可选）", type="password", key="gate_admin_main")
+        submitted = st.form_submit_button("登录", use_container_width=True)
+
+    if submitted or submitted_sb:
+        code_val = (code_in or code_in_sb or "").strip().upper()
+        admin_val = (admin_in or admin_in_sb or "").strip()
+
+        ok_weekly = bool(code_val) and (code_val == weekly_code.upper())
+        ok_admin = bool(admin_val) and (admin_val == admin_key)
 
         if ok_weekly or ok_admin:
             st.session_state.authed = True
             st.session_state.is_admin = bool(ok_admin)
             st.rerun()
         else:
-            st.sidebar.error("访问码或管理员密钥不正确。")
+            st.error("访问码或管理员密钥不正确。")
 
-    st.info("需要访问码才能使用（每周一自动刷新）。")
     st.stop()
 
 
@@ -369,10 +410,10 @@ def rate_limit(min_interval_sec: float = 1.4, max_per_day: int = 400):
         st.stop()
 
 
-# ✅ 先门禁（门禁不依赖 DB）
+# 先门禁（不依赖 DB）
 require_gate()
 
-# ✅ 登录后再初始化 DB（DB 挂了也会明确报错，不再是 redacted 红屏）
+# 登录后初始化 DB
 try:
     ensure_tables_safe()
 except Exception as e:
@@ -393,7 +434,7 @@ if "mode" not in st.session_state:
 if "selected_character" not in st.session_state:
     st.session_state.selected_character = list(CHARACTERS.keys())[0]
 
-# 未读：上次查看时间（每个角色）
+# 未读
 if "last_seen_ts" not in st.session_state:
     st.session_state.last_seen_ts = {ch: 0.0 for ch in CHARACTERS.keys()}
 
@@ -640,7 +681,6 @@ def fmt_time_label(dt: datetime) -> str:
         local_dt = dt.astimezone(LA_TZ)
     except Exception:
         local_dt = dt
-
     now = datetime.now(LA_TZ)
     if local_dt.date() == now.date():
         return local_dt.strftime("%H:%M")
@@ -794,7 +834,7 @@ def get_proactive_message(character: str, history: list[dict]) -> list[str]:
 
 
 # =========================
-# 管理员后台
+# 管理员后台（登录后可用 DB override）
 # =========================
 if st.session_state.get("is_admin"):
     st.sidebar.divider()
@@ -804,6 +844,7 @@ if st.session_state.get("is_admin"):
     w_this = current_week_id()
     w_next = next_week_id()
 
+    # ✅ 登录后可以读 DB override
     code_this = effective_weekly_code(seed, w_this)
     code_next = effective_weekly_code(seed, w_next)
 
@@ -812,7 +853,7 @@ if st.session_state.get("is_admin"):
         st.info(f"下周访问码（{w_next}）：{code_next}")
 
         st.markdown("---")
-        st.caption("重置=写入 DB override（若 DB 可用）。DB 不可用时无法重置，但周码仍会自动每周变。")
+        st.caption("重置=写入 DB override（DB 可用时生效）。")
         confirm = st.checkbox("我确认要重置本周访问码", value=False)
         if st.button("♻️ 重置本周访问码", type="primary", disabled=(not confirm)):
             try:
@@ -890,7 +931,7 @@ else:
 
 
 # =========================
-# 好友列表（微信样式）
+# 好友列表（微信样式：头像+名字+preview+未读）
 # =========================
 def avatar_small_html(avatar):
     if isinstance(avatar, str) and avatar.startswith("data:"):
@@ -953,7 +994,7 @@ with colB:
 
 
 # =========================
-# 主动消息
+# 主动消息（管理员按钮 or 自动概率）
 # =========================
 history = load_messages(character)
 
