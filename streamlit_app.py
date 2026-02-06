@@ -527,6 +527,12 @@ if "random_chat_due_ts" not in st.session_state:
     st.session_state.random_chat_due_ts = time.time() + random.randint(60, 300)
 if "random_chat_fired" not in st.session_state:
     st.session_state.random_chat_fired = False
+if "group_random_due_ts" not in st.session_state:
+    st.session_state.group_random_due_ts = time.time() + random.randint(20, 120)
+if "group_random_fired" not in st.session_state:
+    st.session_state.group_random_fired = False
+if "group_pending" not in st.session_state:
+    st.session_state.group_pending = []
 
 
 # =========================
@@ -1298,14 +1304,7 @@ elif st.session_state.selected_character == GROUP_CHAT:
     character = GROUP_CHAT
 
 if character == GROUP_CHAT:
-    name_col, action_col = st.columns([3, 1])
-    with name_col:
-        group_name_input = st.text_input("群聊名称", value=GROUP_DISPLAY_NAME, key="group_name_input")
-    with action_col:
-        if st.button("保存群聊名称", use_container_width=True):
-            upsert_setting("GROUP_NAME", group_name_input.strip() or GROUP_CHAT)
-            st.success("群聊名称已更新。")
-            st.rerun()
+    GROUP_DISPLAY_NAME = SETTINGS.get("GROUP_NAME", GROUP_CHAT)
 
 
 def maybe_trigger_random_chat():
@@ -1323,6 +1322,42 @@ def maybe_trigger_random_chat():
     st.rerun()
 
 
+def queue_group_messages(speaker: str, messages: list[str], start_delay: int | None = None):
+    delay = start_delay if start_delay is not None else random.randint(2, 5)
+    for msg in messages:
+        st.session_state.group_pending.append(
+            {"speaker": speaker, "role": "assistant", "content": msg, "due_ts": time.time() + delay}
+        )
+        delay += random.randint(2, 5)
+
+
+def maybe_trigger_group_random_chat():
+    if st.session_state.get("group_random_fired"):
+        return
+    due_ts = st.session_state.get("group_random_due_ts")
+    if not due_ts or time.time() < float(due_ts):
+        return
+    starter = random.choice(GROUP_MEMBERS)
+    history = load_group_messages()
+    msgs = get_group_proactive_message(starter, history)
+    queue_group_messages(starter, msgs, start_delay=random.randint(2, 6))
+    st.session_state.group_random_fired = True
+
+
+def process_group_pending():
+    pending = st.session_state.get("group_pending", [])
+    if not pending:
+        return
+    now_ts = time.time()
+    ready = [p for p in pending if p.get("due_ts", 0) <= now_ts]
+    if not ready:
+        return
+    remaining = [p for p in pending if p.get("due_ts", 0) > now_ts]
+    for item in sorted(ready, key=lambda x: x.get("due_ts", 0)):
+        save_group_message(item["speaker"], item.get("role", "assistant"), item["content"])
+    st.session_state.group_pending = remaining
+
+
 # =========================
 # 主动消息（管理员按钮 or 自动概率）
 # =========================
@@ -1332,6 +1367,8 @@ else:
     history = load_messages(character)
 
 maybe_trigger_random_chat()
+maybe_trigger_group_random_chat()
+process_group_pending()
 
 if character != GROUP_CHAT and proactive_now:
     rate_limit(1.0, 600)
@@ -1434,6 +1471,9 @@ else:
 if character != GROUP_CHAT and has_pending_for(character):
     time.sleep(0.35)
     st.rerun()
+if character == GROUP_CHAT and st.session_state.get("group_pending"):
+    time.sleep(0.35)
+    st.rerun()
 
 
 # =========================
@@ -1446,12 +1486,14 @@ if user_text:
         save_group_message("user", "user", user_text)
         mark_group_seen()
         history = load_group_messages()
-        responders = GROUP_MEMBERS
+        responders = random.sample(GROUP_MEMBERS, k=len(GROUP_MEMBERS))
+        delay_seed = random.randint(2, 5)
         for responder in responders:
             replies = get_group_ai_reply(responder, history)
-            for r in replies:
-                save_group_message(responder, "assistant", r)
-            history = load_group_messages()
+            queue_group_messages(responder, replies, start_delay=delay_seed)
+            for reply in replies:
+                history.append({"speaker": responder, "role": "assistant", "content": reply})
+            delay_seed += random.randint(2, 5)
         st.rerun()
     else:
         save_message(character, "user", user_text)
