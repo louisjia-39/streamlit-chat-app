@@ -511,6 +511,10 @@ if "session_id" not in st.session_state:
 if "mode" not in st.session_state:
     st.session_state.mode = "聊天"
 
+# 色色模式（仅单聊）
+if "sexy_mode" not in st.session_state:
+    st.session_state.sexy_mode = {ch: False for ch in CHARACTERS.keys()}
+
 # 默认选中角色
 if "selected_character" not in st.session_state:
     st.session_state.selected_character = list(CHARACTERS.keys())[0]
@@ -658,6 +662,34 @@ def file_to_data_url(uploaded_file) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+def build_teaching_attachments(uploaded_files: list) -> list[dict]:
+    attachments: list[dict] = []
+    if not uploaded_files:
+        return attachments
+    text_limit = 6000
+    for up in uploaded_files:
+        mime = (up.type or "").lower()
+        name = up.name or "附件"
+        data = up.getvalue()
+        if mime.startswith("image/"):
+            b64 = base64.b64encode(data).decode("utf-8")
+            attachments.append(
+                {"type": "image", "name": name, "data_url": f"data:{mime};base64,{b64}"}
+            )
+            continue
+        try:
+            text = data.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            text = ""
+        if text:
+            if len(text) > text_limit:
+                text = text[:text_limit] + "\n...（内容过长已截断）"
+            attachments.append({"type": "text", "name": name, "text": f"【文件：{name}】\n{text}"})
+        else:
+            attachments.append({"type": "text", "name": name, "text": f"【文件：{name}】（无法解析为文本）"})
+    return attachments
+
+
 def upsert_avatar(key_name: str, avatar_data_url: str | None):
     q = text("""
         INSERT INTO character_profiles (character, avatar_data_url)
@@ -763,6 +795,23 @@ def mark_seen(character: str):
             latest_ts = dt.timestamp()
             break
     st.session_state.last_seen_ts[character] = max(st.session_state.last_seen_ts.get(character, 0.0), latest_ts)
+
+
+def ensure_sexy_mode_entry(character: str):
+    if "sexy_mode" not in st.session_state:
+        st.session_state.sexy_mode = {}
+    if character not in st.session_state.sexy_mode:
+        st.session_state.sexy_mode[character] = False
+
+
+def is_sexy_mode(character: str) -> bool:
+    ensure_sexy_mode_entry(character)
+    return bool(st.session_state.sexy_mode.get(character))
+
+
+def set_sexy_mode(character: str, enabled: bool):
+    ensure_sexy_mode_entry(character)
+    st.session_state.sexy_mode[character] = enabled
 
 
 def preview_text(s: str, n: int = 22) -> str:
@@ -956,7 +1005,7 @@ def render_typing(character: str):
 # =========================
 # OpenAI：聊天/教学
 # =========================
-def build_system_prompt(character: str, mode: str) -> str:
+def build_system_prompt(character: str, mode: str, sexy_mode: bool = False) -> str:
     base_persona = f"你在扮演{character}，性格是：{CHARACTERS[character]}。"
 
     if mode == "教学":
@@ -968,14 +1017,22 @@ def build_system_prompt(character: str, mode: str) -> str:
         extra = SETTINGS.get("PROMPT_TEACH_EXTRA", "")
         return base_persona + "\n" + teach_core + ("\n" + extra if extra else "")
 
+    sexy_core = ""
+    if sexy_mode:
+        sexy_core = (
+            "\n你现在进入【色色模式】。\n"
+            "允许R18+成人话题，关系更亲密、语气更暧昧开放。\n"
+            "保持双方自愿与尊重，不要越界到不适内容。"
+        )
+
     chat_core = (
         "你现在进入【聊天模式】。\n"
         "要求：像真实微信聊天，不要AI味；句子自然；可以有情绪；不要长篇论文；避免‘作为AI’。\n"
         "输出格式：只输出一个 JSON 数组，例如 [\"消息1\",\"消息2\"]。\n"
-        "规则：数组最多3条；每条1-2句话；每条尽量短（像微信）；不要输出除 JSON 外任何文字。"
+        "规则：数组1-5条（条数随机）；每条1-2句话；每条尽量短（像微信）；不要输出除 JSON 外任何文字。"
     )
     extra = SETTINGS.get("PROMPT_CHAT_EXTRA", "")
-    return base_persona + "\n" + chat_core + ("\n" + extra if extra else "")
+    return base_persona + "\n" + chat_core + sexy_core + ("\n" + extra if extra else "")
 
 
 def call_openai(messages, temperature: float):
@@ -991,28 +1048,57 @@ def call_openai(messages, temperature: float):
     return resp.choices[0].message.content
 
 
-def parse_chat_messages(raw: str) -> list[str]:
+def parse_chat_messages(raw: str, max_messages: int = 5) -> list[str]:
     raw = (raw or "").strip()
     try:
         arr = json.loads(raw)
         if isinstance(arr, list):
             msgs = [x.strip() for x in arr if isinstance(x, str) and x.strip()]
-            return msgs[:3]
+            return msgs[:max_messages]
     except Exception:
         pass
     parts = [p.strip() for p in re.split(r"\n+|---+|•|\u2022", raw) if p.strip()]
-    return parts[:3]
+    return parts[:max_messages]
 
 
-def get_ai_reply(character: str, history: list[dict], user_text: str, mode: str) -> list[str]:
+def pick_random_messages(messages: list[str], min_count: int = 1, max_count: int = 5) -> list[str]:
+    if not messages:
+        return []
+    target = random.randint(min_count, max_count)
+    if len(messages) <= target:
+        return messages
+    return messages[:target]
+
+
+def get_ai_reply(
+    character: str,
+    history: list[dict],
+    user_text: str,
+    mode: str,
+    sexy_mode: bool = False,
+    attachments: list[dict] | None = None,
+) -> list[str]:
     if "OPENAI_API_KEY" not in st.secrets:
         return [f"（测试模式）{character} 收到了：{user_text}"]
 
-    system_prompt = build_system_prompt(character, mode)
+    system_prompt = build_system_prompt(character, mode, sexy_mode=sexy_mode)
     messages = [{"role": "system", "content": system_prompt}]
     for m in history[-15:]:
         messages.append({"role": m["role"], "content": m["content"]})
-    messages.append({"role": "user", "content": user_text})
+    if attachments:
+        content_parts: list[dict] = [{"type": "text", "text": user_text}]
+        for item in attachments:
+            if item.get("type") == "image":
+                if item.get("name"):
+                    content_parts.append({"type": "text", "text": f"【图片：{item.get('name')}】"})
+                content_parts.append(
+                    {"type": "image_url", "image_url": {"url": item.get("data_url", "")}}
+                )
+            elif item.get("type") == "text":
+                content_parts.append({"type": "text", "text": item.get("text", "")})
+        messages.append({"role": "user", "content": content_parts})
+    else:
+        messages.append({"role": "user", "content": user_text})
 
     temp = s_float("TEMP_TEACH", 0.35) if mode == "教学" else s_float("TEMP_CHAT", 1.05)
     raw = call_openai(messages, temp)
@@ -1020,7 +1106,7 @@ def get_ai_reply(character: str, history: list[dict], user_text: str, mode: str)
     if mode == "教学":
         return [raw.strip()]
 
-    msgs = parse_chat_messages(raw)
+    msgs = pick_random_messages(parse_chat_messages(raw))
     return msgs if msgs else [raw.strip() or "嗯？"]
 
 
@@ -1072,8 +1158,8 @@ def get_group_proactive_message(character: str, history: list[dict]) -> list[str
     return msgs[:2] if msgs else ["在吗？"]
 
 
-def get_proactive_message(character: str, history: list[dict]) -> list[str]:
-    system_prompt = build_system_prompt(character, "聊天")
+def get_proactive_message(character: str, history: list[dict], sexy_mode: bool = False) -> list[str]:
+    system_prompt = build_system_prompt(character, "聊天", sexy_mode=sexy_mode)
     messages = [{"role": "system", "content": system_prompt}]
     for m in history[-10:]:
         messages.append({"role": m["role"], "content": m["content"]})
@@ -1294,7 +1380,10 @@ with colB:
     current_mode = st.session_state.mode if st.session_state.mode in mode_options else "聊天"
     mode = st.selectbox("模式", mode_options, index=mode_options.index(current_mode))
     st.session_state.mode = mode
-    st.markdown(f'<div class="wx-pill">模式：{mode}</div>', unsafe_allow_html=True)
+    if character != GROUP_CHAT and is_sexy_mode(character):
+        st.markdown('<div class="wx-pill">模式：色色</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="wx-pill">模式：{mode}</div>', unsafe_allow_html=True)
 
 if st.session_state.mode == GROUP_CHAT:
     st.session_state.selected_character = GROUP_CHAT
@@ -1302,6 +1391,8 @@ if st.session_state.mode == GROUP_CHAT:
 elif st.session_state.selected_character == GROUP_CHAT:
     st.session_state.mode = GROUP_CHAT
     character = GROUP_CHAT
+elif is_sexy_mode(character):
+    st.session_state.mode = "聊天"
 
 if character == GROUP_CHAT:
     GROUP_DISPLAY_NAME = SETTINGS.get("GROUP_NAME", GROUP_CHAT)
@@ -1315,7 +1406,7 @@ def maybe_trigger_random_chat():
         return
     starter = random.choice(list(CHARACTERS.keys()))
     history = load_messages(starter)
-    msgs = get_proactive_message(starter, history)
+    msgs = get_proactive_message(starter, history, sexy_mode=is_sexy_mode(starter))
     for m in msgs:
         save_message(starter, "assistant", m)
     st.session_state.random_chat_fired = True
@@ -1372,7 +1463,7 @@ process_group_pending()
 
 if character != GROUP_CHAT and proactive_now:
     rate_limit(1.0, 600)
-    msgs = get_proactive_message(character, history)
+    msgs = get_proactive_message(character, history, sexy_mode=is_sexy_mode(character))
     for m in msgs:
         save_message(character, "assistant", m)
     st.rerun()
@@ -1386,7 +1477,7 @@ if character != GROUP_CHAT and st.session_state.mode == "聊天" and s_bool("PRO
     if now_ts - last_ts >= interval_min * 60:
         st.session_state[last_key] = now_ts
         if random.randint(1, 100) <= prob_pct:
-            msgs = get_proactive_message(character, history)
+            msgs = get_proactive_message(character, history, sexy_mode=is_sexy_mode(character))
             for m in msgs:
                 save_message(character, "assistant", m)
             st.rerun()
@@ -1395,9 +1486,14 @@ if character != GROUP_CHAT and st.session_state.mode == "聊天" and s_bool("PRO
 # =========================
 # “正在输入”延迟回复
 # =========================
-def start_pending_reply(character: str, mode: str):
+def start_pending_reply(character: str, mode: str, attachments: list[dict] | None = None):
     delay = random.randint(1, 5)
-    st.session_state.pending = {"character": character, "mode": mode, "due_ts": time.time() + delay}
+    st.session_state.pending = {
+        "character": character,
+        "mode": mode,
+        "due_ts": time.time() + delay,
+        "attachments": attachments or [],
+    }
 
 
 def has_pending_for(character: str) -> bool:
@@ -1414,6 +1510,7 @@ def maybe_finish_pending():
 
     ch = p.get("character")
     mode = p.get("mode", "聊天")
+    attachments = p.get("attachments", [])
     hist = load_messages(ch)
 
     last_user = None
@@ -1426,7 +1523,7 @@ def maybe_finish_pending():
         return
 
     rate_limit(1.0, 600)
-    replies = get_ai_reply(ch, hist, last_user, mode)
+    replies = get_ai_reply(ch, hist, last_user, mode, sexy_mode=is_sexy_mode(ch), attachments=attachments)
     for r in replies:
         save_message(ch, "assistant", r)
 
@@ -1477,6 +1574,20 @@ if character == GROUP_CHAT and st.session_state.get("group_pending"):
 
 
 # =========================
+# 教学模式附件（图片/文件）
+# =========================
+teach_uploads = None
+if character != GROUP_CHAT and st.session_state.mode == "教学":
+    teach_uploads = st.file_uploader(
+        "教学模式附件（图片/文件，可多选）",
+        type=["png", "jpg", "jpeg", "gif", "txt", "md", "csv", "json"],
+        accept_multiple_files=True,
+        key="teach_uploader",
+        help="图片会直接传给模型；文本类文件会作为文字内容附加。",
+    )
+
+
+# =========================
 # 输入：用户发消息
 # =========================
 user_text = st.chat_input("输入消息…")
@@ -1496,7 +1607,21 @@ if user_text:
             delay_seed += random.randint(2, 5)
         st.rerun()
     else:
+        normalized = user_text.strip()
+        if normalized in ("打开色色模式", "关闭色色模式"):
+            set_sexy_mode(character, normalized == "打开色色模式")
+            save_message(character, "user", user_text)
+            reply = "已开启色色模式。" if normalized == "打开色色模式" else "已关闭色色模式。"
+            save_message(character, "assistant", reply)
+            mark_seen(character)
+            st.session_state.mode = "聊天"
+            st.rerun()
+        attachments = []
+        if st.session_state.mode == "教学" and teach_uploads:
+            attachments = build_teaching_attachments(teach_uploads)
+            if "teach_uploader" in st.session_state:
+                st.session_state["teach_uploader"] = None
         save_message(character, "user", user_text)
         mark_seen(character)
-        start_pending_reply(character, st.session_state.mode)
+        start_pending_reply(character, st.session_state.mode, attachments=attachments)
         st.rerun()
