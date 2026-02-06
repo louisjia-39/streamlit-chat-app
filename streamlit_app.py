@@ -54,6 +54,7 @@ DEFAULT_SETTINGS = {
     "PROACTIVE_MIN_INTERVAL_MIN": "20",
     "PROACTIVE_PROB_PCT": "25",
     "TIME_DIVIDER_GRANULARITY": "minute",  # minute / 5min
+    "GROUP_NAME": GROUP_CHAT,
 }
 
 
@@ -104,6 +105,36 @@ section[data-testid="stSidebar"] { background:#F7F7F7; }
   color:white;
   font-size:12px; line-height:18px;
   text-align:center;
+}
+.unread-dot {
+  width:10px; height:10px;
+  border-radius:999px;
+  background:#FF3B30;
+  flex: 0 0 10px;
+}
+.group-avatar {
+  display:grid;
+  grid-template-columns: repeat(2, 1fr);
+  grid-template-rows: repeat(2, 1fr);
+  gap:2px;
+  padding:4px;
+  box-sizing:border-box;
+}
+.group-avatar .ga-item {
+  width:100%;
+  height:100%;
+  border-radius:4px;
+  overflow:hidden;
+  background: rgba(0,0,0,.06);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:12px;
+}
+.group-avatar .ga-item img {
+  width:100%;
+  height:100%;
+  object-fit:cover;
 }
 
 /* 主区域 */
@@ -491,6 +522,12 @@ if "last_seen_ts" not in st.session_state:
 if GROUP_CHAT not in st.session_state.last_seen_ts:
     st.session_state.last_seen_ts[GROUP_CHAT] = 0.0
 
+# 登录后随机触发一次主动聊天（1-5分钟）
+if "random_chat_due_ts" not in st.session_state:
+    st.session_state.random_chat_due_ts = time.time() + random.randint(60, 300)
+if "random_chat_fired" not in st.session_state:
+    st.session_state.random_chat_fired = False
+
 
 # =========================
 # Settings（DB）
@@ -517,6 +554,7 @@ def upsert_setting(key: str, value: str):
 
 
 SETTINGS = load_settings()
+GROUP_DISPLAY_NAME = SETTINGS.get("GROUP_NAME", GROUP_CHAT)
 
 
 def s_float(key: str, default: float) -> float:
@@ -1145,6 +1183,19 @@ def avatar_small_html(avatar):
     return f'<div class="avatar">{_html.escape(str(avatar))}</div>'
 
 
+def group_avatar_html(members: list[str]):
+    items = []
+    for name in members[:4]:
+        avatar = avatar_for("assistant", name)
+        if isinstance(avatar, str) and avatar.startswith("data:"):
+            items.append(f'<div class="ga-item"><img src="{avatar}"/></div>')
+        else:
+            items.append(f'<div class="ga-item">{_html.escape(str(avatar))}</div>')
+    while len(items) < 4:
+        items.append('<div class="ga-item"></div>')
+    return f'<div class="avatar group-avatar">{"".join(items)}</div>'
+
+
 def render_friend_item(character: str, active: bool):
     meta = get_latest_message_meta(character)
     pv = ""
@@ -1158,7 +1209,7 @@ def render_friend_item(character: str, active: bool):
     item_class = "wx-item active" if active else "wx-item"
     badge_html = ""
     if unread > 0 and (not active):
-        badge_html = f'<div class="unread-badge">{unread if unread < 100 else "99+"}</div>'
+        badge_html = '<div class="unread-dot"></div>'
 
     html_block = f"""
     <div class="{item_class}">
@@ -1181,16 +1232,16 @@ def render_group_item(active: bool):
         prefix = "你：" if speaker == "user" else f"{speaker}："
         pv = prefix + preview_text(meta.get("content", ""), 22)
     unread = get_group_unread_count()
-    avatar = DEFAULT_AVATARS.get(GROUP_CHAT, "👥")
+    avatar = group_avatar_html(GROUP_MEMBERS)
     item_class = "wx-item active" if active else "wx-item"
     badge_html = ""
     if unread > 0 and (not active):
-        badge_html = f'<div class="unread-badge">{unread if unread < 100 else "99+"}</div>'
+        badge_html = '<div class="unread-dot"></div>'
     html_block = f"""
     <div class="{item_class}">
-      {avatar_small_html(avatar)}
+      {avatar}
       <div class="meta">
-        <div class="name">{GROUP_CHAT}</div>
+        <div class="name">{_html.escape(GROUP_DISPLAY_NAME)}</div>
         <div class="preview">{_html.escape(pv)}</div>
       </div>
       {badge_html}
@@ -1203,7 +1254,7 @@ st.sidebar.divider()
 st.sidebar.markdown('<div class="sidebar-title">好友列表</div>', unsafe_allow_html=True)
 
 is_group_active = (st.session_state.selected_character == GROUP_CHAT)
-if st.sidebar.button(" ", key="sel_group", help="打开 群聊", use_container_width=True):
+if st.sidebar.button(" ", key="sel_group", help=f"打开 {GROUP_DISPLAY_NAME}", use_container_width=True):
     st.session_state.selected_character = GROUP_CHAT
     st.session_state.mode = GROUP_CHAT
     mark_group_seen()
@@ -1229,9 +1280,9 @@ character = st.session_state.selected_character
 colA, colB = st.columns([4, 1])
 with colA:
     if character == GROUP_CHAT or st.session_state.mode == GROUP_CHAT:
-        st.markdown(f'<div class="wx-title">正在和「{GROUP_CHAT}」聊天</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="wx-title">{_html.escape(GROUP_DISPLAY_NAME)}</div>', unsafe_allow_html=True)
     else:
-        st.markdown(f'<div class="wx-title">正在和「{character}」聊天</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="wx-title">{_html.escape(character)}</div>', unsafe_allow_html=True)
 with colB:
     mode_options = ["聊天", "教学", GROUP_CHAT]
     current_mode = st.session_state.mode if st.session_state.mode in mode_options else "聊天"
@@ -1246,6 +1297,31 @@ elif st.session_state.selected_character == GROUP_CHAT:
     st.session_state.mode = GROUP_CHAT
     character = GROUP_CHAT
 
+if character == GROUP_CHAT:
+    name_col, action_col = st.columns([3, 1])
+    with name_col:
+        group_name_input = st.text_input("群聊名称", value=GROUP_DISPLAY_NAME, key="group_name_input")
+    with action_col:
+        if st.button("保存群聊名称", use_container_width=True):
+            upsert_setting("GROUP_NAME", group_name_input.strip() or GROUP_CHAT)
+            st.success("群聊名称已更新。")
+            st.rerun()
+
+
+def maybe_trigger_random_chat():
+    if st.session_state.get("random_chat_fired"):
+        return
+    due_ts = st.session_state.get("random_chat_due_ts")
+    if not due_ts or time.time() < float(due_ts):
+        return
+    starter = random.choice(list(CHARACTERS.keys()))
+    history = load_messages(starter)
+    msgs = get_proactive_message(starter, history)
+    for m in msgs:
+        save_message(starter, "assistant", m)
+    st.session_state.random_chat_fired = True
+    st.rerun()
+
 
 # =========================
 # 主动消息（管理员按钮 or 自动概率）
@@ -1254,6 +1330,8 @@ if character == GROUP_CHAT:
     history = load_group_messages()
 else:
     history = load_messages(character)
+
+maybe_trigger_random_chat()
 
 if character != GROUP_CHAT and proactive_now:
     rate_limit(1.0, 600)
@@ -1379,22 +1457,4 @@ if user_text:
         save_message(character, "user", user_text)
         mark_seen(character)
         start_pending_reply(character, st.session_state.mode)
-        st.rerun()
-
-if character == GROUP_CHAT:
-    st.caption("群聊小工具：让随机角色先开口，其他人会跟进回复。")
-    if st.button("🎲 随机角色先开口", use_container_width=True):
-        rate_limit(1.0, 600)
-        history = load_group_messages()
-        starter = random.choice(GROUP_MEMBERS)
-        starter_msgs = get_group_proactive_message(starter, history)
-        for m in starter_msgs:
-            save_group_message(starter, "assistant", m)
-        history = load_group_messages()
-        responders = [ch for ch in GROUP_MEMBERS if ch != starter]
-        for responder in responders:
-            replies = get_group_ai_reply(responder, history)
-            for r in replies:
-                save_group_message(responder, "assistant", r)
-            history = load_group_messages()
         st.rerun()
