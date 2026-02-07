@@ -1,4 +1,3 @@
-import uuid
 import time
 import random
 import base64
@@ -56,6 +55,8 @@ DEFAULT_SETTINGS = {
     "TIME_DIVIDER_GRANULARITY": "minute",  # minute / 5min
     "GROUP_NAME": GROUP_CHAT,
 }
+
+DEFAULT_USAGE_LIMIT = 200
 
 
 # =========================
@@ -322,6 +323,55 @@ def ensure_tables_safe():
     ts_default = "CURRENT_TIMESTAMP"
     with c.session as s:
         s.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS users (
+                id {id_type},
+                username TEXT UNIQUE NOT NULL,
+                usage_limit INTEGER NOT NULL DEFAULT {DEFAULT_USAGE_LIMIT},
+                is_banned BOOLEAN NOT NULL DEFAULT 0,
+                created_at {ts_type} NOT NULL DEFAULT {ts_default}
+            );
+        """))
+        s.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS user_usage (
+                user_id INTEGER NOT NULL,
+                week_id TEXT NOT NULL,
+                used INTEGER NOT NULL DEFAULT 0,
+                updated_at {ts_type} NOT NULL DEFAULT {ts_default},
+                PRIMARY KEY (user_id, week_id)
+            );
+        """))
+
+        s.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS chat_messages_v2 (
+                id {id_type},
+                user_id INTEGER NOT NULL,
+                character TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at {ts_type} NOT NULL DEFAULT {ts_default}
+            );
+        """))
+        s.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_v2_user
+            ON chat_messages_v2(user_id, character, created_at);
+        """))
+
+        s.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS group_messages_v2 (
+                id {id_type},
+                user_id INTEGER NOT NULL,
+                speaker TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at {ts_type} NOT NULL DEFAULT {ts_default}
+            );
+        """))
+        s.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_group_messages_v2_user
+            ON group_messages_v2(user_id, created_at);
+        """))
+
+        s.execute(text(f"""
             CREATE TABLE IF NOT EXISTS chat_messages (
                 id {id_type},
                 session_id TEXT NOT NULL,
@@ -412,9 +462,113 @@ def effective_weekly_code(seed: str, week_id: str) -> str:
 
 
 # =========================
-# 门禁：主页面 + sidebar 都能输入（✅ 修复 iPad 看不到输入框）
+# 用户
 # =========================
-def require_gate():
+def normalize_username(raw: str) -> str | None:
+    name = (raw or "").strip()
+    if not name:
+        return None
+    if len(name) > 32:
+        return None
+    return name
+
+
+def get_user_by_name(username: str):
+    df = get_conn().query(
+        "SELECT id, username, usage_limit, is_banned FROM users WHERE username = :u LIMIT 1",
+        params={"u": username},
+        ttl=0,
+    )
+    if df.empty:
+        return None
+    return df.iloc[0].to_dict()
+
+
+def create_user(username: str):
+    q = text("""
+        INSERT INTO users (username, usage_limit, is_banned)
+        VALUES (:u, :limit, 0)
+        ON CONFLICT (username) DO NOTHING
+    """)
+    with get_conn().session as s:
+        s.execute(q, {"u": username, "limit": DEFAULT_USAGE_LIMIT})
+        s.commit()
+    return get_user_by_name(username)
+
+
+def set_user_banned(user_id: int, banned: bool):
+    q = text("UPDATE users SET is_banned = :b WHERE id = :uid")
+    with get_conn().session as s:
+        s.execute(q, {"uid": user_id, "b": 1 if banned else 0})
+        s.commit()
+
+
+def update_user_limit(user_id: int, limit: int):
+    q = text("UPDATE users SET usage_limit = :l WHERE id = :uid")
+    with get_conn().session as s:
+        s.execute(q, {"uid": user_id, "l": limit})
+        s.commit()
+
+
+def get_user_summary(user_id: int):
+    df = get_conn().query(
+        "SELECT id, username, usage_limit, is_banned FROM users WHERE id = :uid LIMIT 1",
+        params={"uid": user_id},
+        ttl=0,
+    )
+    if df.empty:
+        return None
+    return df.iloc[0].to_dict()
+
+
+def get_user_usage(user_id: int, week_id: str) -> int:
+    df = get_conn().query(
+        "SELECT used FROM user_usage WHERE user_id = :uid AND week_id = :w LIMIT 1",
+        params={"uid": user_id, "w": week_id},
+        ttl=0,
+    )
+    if df.empty:
+        q = text("""
+            INSERT INTO user_usage (user_id, week_id, used)
+            VALUES (:uid, :w, 0)
+            ON CONFLICT (user_id, week_id) DO NOTHING
+        """)
+        with get_conn().session as s:
+            s.execute(q, {"uid": user_id, "w": week_id})
+            s.commit()
+        return 0
+    return int(df.iloc[0]["used"])
+
+
+def consume_usage(user_id: int, week_id: str, limit: int) -> tuple[bool, int]:
+    used = get_user_usage(user_id, week_id)
+    if used >= limit:
+        return False, used
+    new_used = used + 1
+    q = text("""
+        INSERT INTO user_usage (user_id, week_id, used)
+        VALUES (:uid, :w, :used)
+        ON CONFLICT (user_id, week_id)
+        DO UPDATE SET used = EXCLUDED.used,
+                      updated_at = CURRENT_TIMESTAMP
+    """)
+    with get_conn().session as s:
+        s.execute(q, {"uid": user_id, "w": week_id, "used": new_used})
+        s.commit()
+    return True, new_used
+
+
+def get_weekly_code_for_login(seed: str, week_id: str) -> str:
+    try:
+        return effective_weekly_code(seed, week_id)
+    except Exception:
+        return weekly_code_hmac(seed, week_id)
+
+
+# =========================
+# 登录/注册：主页面 + sidebar 都能输入
+# =========================
+def require_login():
     if st.session_state.get("authed"):
         return
 
@@ -429,48 +583,78 @@ def require_gate():
         st.stop()
 
     week_id = current_week_id()
-    weekly_code = weekly_code_hmac(seed, week_id)  # ✅ 门禁阶段不读 DB（保证一定能显示输入框）
+    weekly_code = get_weekly_code_for_login(seed, week_id)
 
-    # ---- Sidebar（可选） ----
-    st.sidebar.subheader("访问控制（每周更新）")
-    code_in_sb = st.sidebar.text_input("输入本周访问码", type="password", key="gate_code_sb")
-    admin_in_sb = st.sidebar.text_input("管理员密钥（可选）", type="password", key="gate_admin_sb")
-    submitted_sb = st.sidebar.button("登录", type="primary", key="gate_submit_sb")
+    st.sidebar.subheader("账号登录 / 注册")
+    username_sb = st.sidebar.text_input("用户名", key="login_user_sb")
+    code_in_sb = st.sidebar.text_input("本周访问码", type="password", key="login_code_sb")
+    admin_in_sb = st.sidebar.text_input("管理员密钥（可选）", type="password", key="login_admin_sb")
+    login_sb = st.sidebar.button("登录", type="primary", key="login_submit_sb")
+    register_sb = st.sidebar.button("注册", key="register_submit_sb")
 
-    # ---- Main（关键：iPad/手机可见） ----
     st.markdown(
         """
         <div style="max-width:680px;margin:40px auto 0 auto;
                     padding:18px 18px;border-radius:14px;
                     background:rgba(255,255,255,.75);
                     border:1px solid rgba(0,0,0,.06);">
-          <div style="font-size:18px;font-weight:800;margin-bottom:8px;">需要访问码才能使用（每周一自动刷新）</div>
+          <div style="font-size:18px;font-weight:800;margin-bottom:8px;">登录 / 注册</div>
           <div style="font-size:13px;color:rgba(0,0,0,.55);margin-bottom:12px;">
-            iPad/手机如果看不到侧边栏，请直接在这里登录（不用打开 sidebar）。
+            使用“用户名 + 本周访问码”注册或登录；管理员可用密钥直接登录。
           </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    with st.form("gate_form_main", clear_on_submit=False):
-        code_in = st.text_input("本周访问码", type="password", key="gate_code_main")
-        admin_in = st.text_input("管理员密钥（可选）", type="password", key="gate_admin_main")
-        submitted = st.form_submit_button("登录", use_container_width=True)
+    login_tab, register_tab = st.tabs(["登录", "注册"])
 
-    if submitted or submitted_sb:
-        code_val = (code_in or code_in_sb or "").strip().upper()
-        admin_val = (admin_in or admin_in_sb or "").strip()
+    with login_tab:
+        with st.form("login_form_main", clear_on_submit=False):
+            username_in = st.text_input("用户名", key="login_user_main")
+            code_in = st.text_input("本周访问码", type="password", key="login_code_main")
+            admin_in = st.text_input("管理员密钥（可选）", type="password", key="login_admin_main")
+            submitted = st.form_submit_button("登录", use_container_width=True)
 
-        ok_weekly = bool(code_val) and (code_val == weekly_code.upper())
-        ok_admin = bool(admin_val) and (admin_val == admin_key)
+    with register_tab:
+        with st.form("register_form_main", clear_on_submit=False):
+            username_reg = st.text_input("用户名", key="register_user_main")
+            code_reg = st.text_input("本周访问码", type="password", key="register_code_main")
+            admin_reg = st.text_input("管理员密钥（可选）", type="password", key="register_admin_main")
+            submitted_reg = st.form_submit_button("注册", use_container_width=True)
 
-        if ok_weekly or ok_admin:
-            st.session_state.authed = True
-            st.session_state.is_admin = bool(ok_admin)
-            st.rerun()
-        else:
+    def handle_login(username_val: str, code_val: str, admin_val: str, is_register: bool):
+        name = normalize_username(username_val)
+        if not name:
+            st.error("请输入有效用户名（最多 32 个字符）。")
+            return
+        ok_weekly = bool(code_val) and (code_val.strip().upper() == weekly_code.upper())
+        ok_admin = bool(admin_val) and (admin_val.strip() == admin_key)
+        if not (ok_weekly or ok_admin):
             st.error("访问码或管理员密钥不正确。")
+            return
+        user = get_user_by_name(name)
+        if is_register:
+            if user:
+                st.error("用户名已存在，请直接登录。")
+                return
+            user = create_user(name)
+        if not user:
+            st.error("用户不存在，请先注册。")
+            return
+        if bool(user.get("is_banned")):
+            st.error("账号已被封禁，请联系管理员。")
+            return
+        st.session_state.authed = True
+        st.session_state.is_admin = bool(ok_admin)
+        st.session_state.user_id = int(user["id"])
+        st.session_state.username = str(user["username"])
+        st.rerun()
+
+    if submitted or login_sb:
+        handle_login(username_in or username_sb, code_in or code_in_sb, admin_in or admin_in_sb, False)
+    if submitted_reg or register_sb:
+        handle_login(username_reg or username_sb, code_reg or code_in_sb, admin_reg or admin_in_sb, True)
 
     st.stop()
 
@@ -491,10 +675,27 @@ def rate_limit(min_interval_sec: float = 1.4, max_per_day: int = 400):
         st.stop()
 
 
-# 先门禁（不依赖 DB）
-require_gate()
+def handle_usage_limit_blocked(character: str, is_group: bool):
+    message = "已欠费：AI 使用量已达上限，请联系管理员。"
+    if is_group:
+        save_group_message("系统", "assistant", message)
+        mark_group_seen()
+    else:
+        save_message(character, "assistant", message)
+        mark_seen(character)
+    st.warning(message)
 
-# 登录后初始化 DB
+
+def try_consume_usage() -> bool:
+    user_summary = get_user_summary(st.session_state.user_id)
+    if not user_summary:
+        return False
+    limit = int(user_summary.get("usage_limit") or DEFAULT_USAGE_LIMIT)
+    ok, _used = consume_usage(st.session_state.user_id, current_week_id(), limit)
+    return ok
+
+
+# 初始化 DB
 try:
     ensure_tables_safe()
 except Exception as e:
@@ -502,10 +703,9 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
+# 先登录
+require_login()
 
-# session id
-if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4())
 
 # 默认模式
 if "mode" not in st.session_state:
@@ -537,6 +737,22 @@ if "group_random_fired" not in st.session_state:
     st.session_state.group_random_fired = False
 if "group_pending" not in st.session_state:
     st.session_state.group_pending = []
+
+
+# =========================
+# 当前用户信息 & Usage
+# =========================
+user_summary = get_user_summary(st.session_state.user_id)
+if not user_summary:
+    st.error("用户信息缺失，请重新登录。")
+    st.session_state.authed = False
+    st.rerun()
+current_week = current_week_id()
+current_used = get_user_usage(st.session_state.user_id, current_week)
+current_limit = int(user_summary.get("usage_limit") or DEFAULT_USAGE_LIMIT)
+
+st.sidebar.markdown(f"**当前用户：{_html.escape(str(user_summary.get('username', '')))}**")
+st.sidebar.markdown(f"AI 使用量：{current_used}/{current_limit}（{current_week}）")
 
 
 # =========================
@@ -724,14 +940,15 @@ def avatar_for(role: str, character: str):
 # =========================
 # DB：消息读写
 # =========================
-def load_messages(character: str):
+def load_messages(character: str, user_id: int | None = None):
+    uid = user_id if user_id is not None else st.session_state.user_id
     q = """
         SELECT id, role, content, created_at
-        FROM chat_messages
-        WHERE session_id = :sid AND character = :ch
+        FROM chat_messages_v2
+        WHERE user_id = :uid AND character = :ch
         ORDER BY created_at
     """
-    df = get_conn().query(q, params={"sid": st.session_state.session_id, "ch": character}, ttl=0)
+    df = get_conn().query(q, params={"uid": uid, "ch": character}, ttl=0)
     recs = df.to_dict("records")
     for r in recs:
         ca = r.get("created_at")
@@ -743,25 +960,27 @@ def load_messages(character: str):
     return recs
 
 
-def save_message(character: str, role: str, content: str):
+def save_message(character: str, role: str, content: str, user_id: int | None = None):
+    uid = user_id if user_id is not None else st.session_state.user_id
     q = text("""
-        INSERT INTO chat_messages (session_id, character, role, content)
-        VALUES (:sid, :ch, :role, :content)
+        INSERT INTO chat_messages_v2 (user_id, character, role, content)
+        VALUES (:uid, :ch, :role, :content)
     """)
     with get_conn().session as s:
-        s.execute(q, {"sid": st.session_state.session_id, "ch": character, "role": role, "content": content})
+        s.execute(q, {"uid": uid, "ch": character, "role": role, "content": content})
         s.commit()
 
 
-def get_latest_message_meta(character: str):
+def get_latest_message_meta(character: str, user_id: int | None = None):
+    uid = user_id if user_id is not None else st.session_state.user_id
     q = """
         SELECT id, role, content, created_at
-        FROM chat_messages
-        WHERE session_id = :sid AND character = :ch
+        FROM chat_messages_v2
+        WHERE user_id = :uid AND character = :ch
         ORDER BY created_at DESC
         LIMIT 1
     """
-    df = get_conn().query(q, params={"sid": st.session_state.session_id, "ch": character}, ttl=0)
+    df = get_conn().query(q, params={"uid": uid, "ch": character}, ttl=0)
     if df.empty:
         return None
     row = df.iloc[0].to_dict()
@@ -822,14 +1041,15 @@ def preview_text(s: str, n: int = 22) -> str:
 # =========================
 # 群聊：消息读写
 # =========================
-def load_group_messages():
+def load_group_messages(user_id: int | None = None):
+    uid = user_id if user_id is not None else st.session_state.user_id
     q = """
         SELECT id, speaker, role, content, created_at
-        FROM group_messages
-        WHERE session_id = :sid
+        FROM group_messages_v2
+        WHERE user_id = :uid
         ORDER BY created_at
     """
-    df = get_conn().query(q, params={"sid": st.session_state.session_id}, ttl=0)
+    df = get_conn().query(q, params={"uid": uid}, ttl=0)
     recs = df.to_dict("records")
     for r in recs:
         ca = r.get("created_at")
@@ -841,25 +1061,65 @@ def load_group_messages():
     return recs
 
 
-def save_group_message(speaker: str, role: str, content: str):
+def save_group_message(speaker: str, role: str, content: str, user_id: int | None = None):
+    uid = user_id if user_id is not None else st.session_state.user_id
     q = text("""
-        INSERT INTO group_messages (session_id, speaker, role, content)
-        VALUES (:sid, :sp, :role, :content)
+        INSERT INTO group_messages_v2 (user_id, speaker, role, content)
+        VALUES (:uid, :sp, :role, :content)
     """)
     with get_conn().session as s:
-        s.execute(q, {"sid": st.session_state.session_id, "sp": speaker, "role": role, "content": content})
+        s.execute(q, {"uid": uid, "sp": speaker, "role": role, "content": content})
         s.commit()
 
 
-def get_group_latest_message_meta():
+def delete_messages(message_ids: list[int], user_id: int | None = None):
+    if not message_ids:
+        return
+    uid = user_id if user_id is not None else st.session_state.user_id
+    params = {"uid": uid}
+    placeholders = []
+    for idx, mid in enumerate(message_ids):
+        key = f"id_{idx}"
+        params[key] = int(mid)
+        placeholders.append(f":{key}")
+    q = text(f"""
+        DELETE FROM chat_messages_v2
+        WHERE user_id = :uid AND id IN ({", ".join(placeholders)})
+    """)
+    with get_conn().session as s:
+        s.execute(q, params)
+        s.commit()
+
+
+def delete_group_messages(message_ids: list[int], user_id: int | None = None):
+    if not message_ids:
+        return
+    uid = user_id if user_id is not None else st.session_state.user_id
+    params = {"uid": uid}
+    placeholders = []
+    for idx, mid in enumerate(message_ids):
+        key = f"id_{idx}"
+        params[key] = int(mid)
+        placeholders.append(f":{key}")
+    q = text(f"""
+        DELETE FROM group_messages_v2
+        WHERE user_id = :uid AND id IN ({", ".join(placeholders)})
+    """)
+    with get_conn().session as s:
+        s.execute(q, params)
+        s.commit()
+
+
+def get_group_latest_message_meta(user_id: int | None = None):
+    uid = user_id if user_id is not None else st.session_state.user_id
     q = """
         SELECT id, speaker, role, content, created_at
-        FROM group_messages
-        WHERE session_id = :sid
+        FROM group_messages_v2
+        WHERE user_id = :uid
         ORDER BY created_at DESC
         LIMIT 1
     """
-    df = get_conn().query(q, params={"sid": st.session_state.session_id}, ttl=0)
+    df = get_conn().query(q, params={"uid": uid}, ttl=0)
     if df.empty:
         return None
     row = df.iloc[0].to_dict()
@@ -1000,6 +1260,40 @@ def render_typing(character: str):
     </div>
     """
     st.markdown(html_block, unsafe_allow_html=True)
+
+
+def render_history_manager(current_character: str):
+    st.sidebar.divider()
+    with st.sidebar.expander("聊天记录管理", expanded=False):
+        if current_character == GROUP_CHAT:
+            history_rows = load_group_messages()
+        else:
+            history_rows = load_messages(current_character)
+        if not history_rows:
+            st.sidebar.caption("暂无聊天记录。")
+            return
+        df = pd.DataFrame(history_rows)
+        df["删除"] = False
+        display_cols = [c for c in ["id", "created_at", "role", "speaker", "content", "删除"] if c in df.columns]
+        editor_df = st.sidebar.data_editor(
+            df[display_cols],
+            use_container_width=True,
+            height=240,
+            key=f"history_editor_{current_character}",
+            column_config={"删除": st.column_config.CheckboxColumn("删除")},
+            hide_index=True,
+        )
+        if st.sidebar.button("删除选中消息", key=f"delete_history_{current_character}"):
+            delete_ids = editor_df.loc[editor_df["删除"] == True, "id"].tolist()  # noqa: E712
+            if delete_ids:
+                if current_character == GROUP_CHAT:
+                    delete_group_messages(delete_ids)
+                else:
+                    delete_messages(delete_ids)
+                st.sidebar.success("已删除选中消息。")
+                st.rerun()
+            else:
+                st.sidebar.info("未选择要删除的消息。")
 
 
 # =========================
@@ -1200,6 +1494,67 @@ if st.session_state.get("is_admin"):
                 st.error("重置失败：数据库不可用。")
                 st.exception(e)
 
+    with st.sidebar.expander("用户管理", expanded=False):
+        users_df = get_conn().query(
+            "SELECT id, username, usage_limit, is_banned FROM users ORDER BY username",
+            ttl=0,
+        )
+        if users_df.empty:
+            st.sidebar.info("暂无用户。")
+        else:
+            user_choices = users_df["username"].tolist()
+            selected_user = st.sidebar.selectbox("选择用户", user_choices)
+            selected_row = users_df[users_df["username"] == selected_user].iloc[0].to_dict()
+            selected_user_id = int(selected_row["id"])
+            selected_limit = int(selected_row.get("usage_limit") or DEFAULT_USAGE_LIMIT)
+            selected_banned = bool(selected_row.get("is_banned"))
+
+            st.sidebar.caption(
+                f"状态：{'已封禁' if selected_banned else '正常'} | Limit：{selected_limit}"
+            )
+            usage_week = current_week_id()
+            usage_used = get_user_usage(selected_user_id, usage_week)
+            st.sidebar.caption(f"本周使用量：{usage_used}/{selected_limit}（{usage_week}）")
+
+            new_limit = st.sidebar.number_input(
+                "调整 AI 使用上限",
+                min_value=0,
+                max_value=9999,
+                value=selected_limit,
+                step=10,
+            )
+            if st.sidebar.button("保存使用上限"):
+                update_user_limit(selected_user_id, int(new_limit))
+                st.sidebar.success("已更新上限。")
+                st.rerun()
+
+            if selected_banned:
+                if st.sidebar.button("解除封号"):
+                    set_user_banned(selected_user_id, False)
+                    st.sidebar.success("已解除封号。")
+                    st.rerun()
+            else:
+                if st.sidebar.button("封号"):
+                    set_user_banned(selected_user_id, True)
+                    st.sidebar.success("已封号。")
+                    st.rerun()
+
+            st.sidebar.markdown("**查看聊天记录**")
+            view_type = st.sidebar.selectbox("记录类型", ["单聊", "群聊"])
+            if view_type == "单聊":
+                view_character = st.sidebar.selectbox("角色", list(CHARACTERS.keys()))
+                history_rows = load_messages(view_character, user_id=selected_user_id)
+            else:
+                history_rows = load_group_messages(user_id=selected_user_id)
+
+            if history_rows:
+                show_df = pd.DataFrame(history_rows)
+                cols = ["created_at", "role", "speaker", "content", "character"]
+                existing_cols = [c for c in cols if c in show_df.columns]
+                st.sidebar.dataframe(show_df[existing_cols], use_container_width=True, height=240)
+            else:
+                st.sidebar.caption("暂无聊天记录。")
+
     st.sidebar.markdown("#### 头像管理（含 user）")
     target = st.sidebar.selectbox("选择要修改头像的对象", ["user"] + list(CHARACTERS.keys()))
     cur = DB_AVATARS.get(target)
@@ -1396,6 +1751,8 @@ elif is_sexy_mode(character):
 
 if character == GROUP_CHAT:
     GROUP_DISPLAY_NAME = SETTINGS.get("GROUP_NAME", GROUP_CHAT)
+
+render_history_manager(character)
 
 
 def maybe_trigger_random_chat():
@@ -1596,6 +1953,9 @@ if user_text:
         rate_limit(1.0, 600)
         save_group_message("user", "user", user_text)
         mark_group_seen()
+        if not try_consume_usage():
+            handle_usage_limit_blocked(character, True)
+            st.rerun()
         history = load_group_messages()
         responders = random.sample(GROUP_MEMBERS, k=len(GROUP_MEMBERS))
         delay_seed = random.randint(2, 5)
@@ -1623,5 +1983,8 @@ if user_text:
                 st.session_state["teach_uploader"] = None
         save_message(character, "user", user_text)
         mark_seen(character)
+        if not try_consume_usage():
+            handle_usage_limit_blocked(character, False)
+            st.rerun()
         start_pending_reply(character, st.session_state.mode, attachments=attachments)
         st.rerun()
