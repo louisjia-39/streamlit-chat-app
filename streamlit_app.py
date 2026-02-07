@@ -54,6 +54,10 @@ DEFAULT_SETTINGS = {
     "PROACTIVE_PROB_PCT": "25",
     "TIME_DIVIDER_GRANULARITY": "minute",  # minute / 5min
     "GROUP_NAME": GROUP_CHAT,
+    "SUMMARY_MIN_COUNT": "3",
+    "SUMMARY_MAX_COUNT": "5",
+    "SUMMARY_MAX_CHARS": "220",
+    "PROACTIVE_MIN_USER_IDLE_MIN": "5",
 }
 
 DEFAULT_USAGE_LIMIT = 200
@@ -398,6 +402,14 @@ def ensure_tables_safe():
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
+                updated_at {ts_type} NOT NULL DEFAULT {ts_default}
+            );
+        """))
+        s.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS user_context_prompts (
+                user_id INTEGER PRIMARY KEY,
+                prompt TEXT NOT NULL DEFAULT '',
+                last_summary_at {ts_type},
                 updated_at {ts_type} NOT NULL DEFAULT {ts_default}
             );
         """))
@@ -783,6 +795,164 @@ SETTINGS = load_settings()
 GROUP_DISPLAY_NAME = SETTINGS.get("GROUP_NAME", GROUP_CHAT)
 
 
+def get_user_prompt_record(user_id: int) -> dict | None:
+    df = get_conn().query(
+        "SELECT user_id, prompt, last_summary_at, updated_at FROM user_context_prompts WHERE user_id = :uid LIMIT 1",
+        params={"uid": user_id},
+        ttl=0,
+    )
+    if df.empty:
+        return None
+    row = df.iloc[0].to_dict()
+    last_summary_at = row.get("last_summary_at")
+    if isinstance(last_summary_at, str):
+        try:
+            row["last_summary_at"] = datetime.fromisoformat(last_summary_at.replace("Z", "+00:00"))
+        except Exception:
+            row["last_summary_at"] = None
+    return row
+
+
+def upsert_user_prompt(user_id: int, prompt: str, last_summary_at: datetime | None = None):
+    q = text("""
+        INSERT INTO user_context_prompts (user_id, prompt, last_summary_at)
+        VALUES (:uid, :prompt, :lsa)
+        ON CONFLICT (user_id)
+        DO UPDATE SET prompt = EXCLUDED.prompt,
+                      last_summary_at = COALESCE(EXCLUDED.last_summary_at, user_context_prompts.last_summary_at),
+                      updated_at = CURRENT_TIMESTAMP;
+    """)
+    with get_conn().session as s:
+        s.execute(q, {"uid": user_id, "prompt": prompt, "lsa": last_summary_at})
+        s.commit()
+
+
+def get_user_prompt_text(user_id: int) -> str:
+    record = get_user_prompt_record(user_id)
+    if not record:
+        return ""
+    return str(record.get("prompt") or "").strip()
+
+
+def _normalize_dt_for_query(dt: datetime | None) -> datetime:
+    if not dt:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def count_user_messages_since(user_id: int, since_dt: datetime | None) -> int:
+    since_dt = _normalize_dt_for_query(since_dt)
+    params = {"uid": user_id, "since": since_dt.isoformat()}
+    q = """
+        SELECT COUNT(*) AS cnt FROM (
+            SELECT created_at FROM chat_messages_v2
+            WHERE user_id = :uid AND role = 'user' AND created_at >= :since
+            UNION ALL
+            SELECT created_at FROM group_messages_v2
+            WHERE user_id = :uid AND role = 'user' AND created_at >= :since
+        ) t
+    """
+    df = get_conn().query(q, params=params, ttl=0)
+    if df.empty:
+        return 0
+    return int(df.iloc[0]["cnt"] or 0)
+
+
+def load_recent_messages_for_summary(user_id: int, since_dt: datetime | None, limit: int = 24) -> list[dict]:
+    since_dt = _normalize_dt_for_query(since_dt)
+    params = {"uid": user_id, "since": since_dt.isoformat(), "limit": int(limit)}
+    q = """
+        SELECT created_at, source, speaker, role, content FROM (
+            SELECT created_at, '单聊' AS source, character AS speaker, role, content
+            FROM chat_messages_v2
+            WHERE user_id = :uid AND created_at >= :since
+            UNION ALL
+            SELECT created_at, '群聊' AS source, speaker, role, content
+            FROM group_messages_v2
+            WHERE user_id = :uid AND created_at >= :since
+        ) t
+        ORDER BY created_at
+        LIMIT :limit
+    """
+    df = get_conn().query(q, params=params, ttl=0)
+    return df.to_dict("records")
+
+
+def get_next_summary_threshold(user_id: int) -> int:
+    key = f"summary_threshold_{user_id}"
+    if key not in st.session_state:
+        min_cnt = s_int("SUMMARY_MIN_COUNT", 3)
+        max_cnt = s_int("SUMMARY_MAX_COUNT", 5)
+        st.session_state[key] = random.randint(min_cnt, max_cnt)
+    return int(st.session_state[key])
+
+
+def reset_summary_threshold(user_id: int):
+    key = f"summary_threshold_{user_id}"
+    min_cnt = s_int("SUMMARY_MIN_COUNT", 3)
+    max_cnt = s_int("SUMMARY_MAX_COUNT", 5)
+    st.session_state[key] = random.randint(min_cnt, max_cnt)
+
+
+def maybe_update_user_prompt(user_id: int):
+    if "OPENAI_API_KEY" not in st.secrets:
+        return
+    record = get_user_prompt_record(user_id)
+    last_summary_at = record.get("last_summary_at") if record else None
+    new_user_msgs = count_user_messages_since(user_id, last_summary_at)
+    if new_user_msgs < get_next_summary_threshold(user_id):
+        return
+
+    recent = load_recent_messages_for_summary(user_id, last_summary_at, limit=24)
+    if not recent:
+        return
+
+    existing_prompt = (record.get("prompt") if record else "") or ""
+    max_chars = s_int("SUMMARY_MAX_CHARS", 220)
+    summary_system = (
+        "你是对话记忆压缩器。请根据新增对话更新【用户上下文摘要】。\n"
+        "目标：保持聊天记忆，不遗漏关键事实；同时尽量压缩 token。\n"
+        "保留：用户偏好/禁忌、关系进展、称呼/语气、长期目标、重要事件。\n"
+        "删除：重复信息、寒暄、无关细节。\n"
+        f"输出限制：中文，<= {max_chars} 字，仅输出摘要文本。"
+    )
+    transcript_lines = []
+    for item in recent:
+        source = item.get("source", "")
+        speaker = item.get("speaker", "")
+        role = item.get("role", "")
+        content = item.get("content", "")
+        label = "用户" if role == "user" else speaker
+        if source == "群聊":
+            label = f"{label}(群聊)"
+        transcript_lines.append(f"{label}: {content}")
+    transcript = "\n".join(transcript_lines)
+
+    summary_user = (
+        f"已有摘要：{existing_prompt or '（无）'}\n"
+        "新增对话：\n"
+        f"{transcript}\n"
+        "请输出更新后的摘要："
+    )
+    try:
+        new_prompt = call_openai(
+            [
+                {"role": "system", "content": summary_system},
+                {"role": "user", "content": summary_user},
+            ],
+            temperature=0.2,
+        )
+    except Exception:
+        return
+    new_prompt = (new_prompt or "").strip()
+    if not new_prompt:
+        return
+    upsert_user_prompt(user_id, new_prompt, last_summary_at=datetime.now(timezone.utc))
+    reset_summary_threshold(user_id)
+
+
 def s_float(key: str, default: float) -> float:
     try:
         return float(SETTINGS.get(key, str(default)))
@@ -800,6 +970,10 @@ def s_int(key: str, default: int) -> int:
 def s_bool(key: str, default: bool) -> bool:
     v = SETTINGS.get(key, "1" if default else "0").strip()
     return v in ("1", "true", "True", "yes", "YES", "on", "ON")
+
+
+def s_str(key: str, default: str) -> str:
+    return str(SETTINGS.get(key, default))
 
 
 # =========================
@@ -1036,6 +1210,15 @@ def set_sexy_mode(character: str, enabled: bool):
 def preview_text(s: str, n: int = 22) -> str:
     s = re.sub(r"\s+", " ", (s or "")).strip()
     return s if len(s) <= n else (s[:n] + "…")
+
+
+def get_last_user_message_ts(history: list[dict]) -> float | None:
+    for msg in reversed(history):
+        if msg.get("role") == "user":
+            dt = msg.get("created_at")
+            if isinstance(dt, datetime):
+                return dt.timestamp()
+    return None
 
 
 # =========================
@@ -1299,8 +1482,14 @@ def render_history_manager(current_character: str):
 # =========================
 # OpenAI：聊天/教学
 # =========================
-def build_system_prompt(character: str, mode: str, sexy_mode: bool = False) -> str:
+def build_system_prompt(character: str, mode: str, sexy_mode: bool = False, user_prompt: str = "") -> str:
     base_persona = f"你在扮演{character}，性格是：{CHARACTERS[character]}。"
+    context_hint = ""
+    if user_prompt:
+        context_hint = (
+            "\n以下是用户上下文摘要（用于保持记忆，尽量简短，不必重复历史）：\n"
+            f"{user_prompt}"
+        )
 
     if mode == "教学":
         teach_core = (
@@ -1309,7 +1498,7 @@ def build_system_prompt(character: str, mode: str, sexy_mode: bool = False) -> s
             "要求：先澄清题目与目标；分步骤讲解；必要时反问引导；给练习与检查点；避免空话。"
         )
         extra = SETTINGS.get("PROMPT_TEACH_EXTRA", "")
-        return base_persona + "\n" + teach_core + ("\n" + extra if extra else "")
+        return base_persona + context_hint + "\n" + teach_core + ("\n" + extra if extra else "")
 
     sexy_core = ""
     if sexy_mode:
@@ -1326,7 +1515,7 @@ def build_system_prompt(character: str, mode: str, sexy_mode: bool = False) -> s
         "规则：数组1-5条（条数随机）；每条1-2句话；每条尽量短（像微信）；不要输出除 JSON 外任何文字。"
     )
     extra = SETTINGS.get("PROMPT_CHAT_EXTRA", "")
-    return base_persona + "\n" + chat_core + sexy_core + ("\n" + extra if extra else "")
+    return base_persona + context_hint + "\n" + chat_core + sexy_core + ("\n" + extra if extra else "")
 
 
 def call_openai(messages, temperature: float):
@@ -1375,9 +1564,11 @@ def get_ai_reply(
     if "OPENAI_API_KEY" not in st.secrets:
         return [f"（测试模式）{character} 收到了：{user_text}"]
 
-    system_prompt = build_system_prompt(character, mode, sexy_mode=sexy_mode)
+    user_prompt = get_user_prompt_text(st.session_state.user_id)
+    system_prompt = build_system_prompt(character, mode, sexy_mode=sexy_mode, user_prompt=user_prompt)
     messages = [{"role": "system", "content": system_prompt}]
-    for m in history[-15:]:
+    history_limit = 12 if mode == "教学" else 8
+    for m in history[-history_limit:]:
         messages.append({"role": m["role"], "content": m["content"]})
     if attachments:
         content_parts: list[dict] = [{"type": "text", "text": user_text}]
@@ -1405,7 +1596,8 @@ def get_ai_reply(
 
 
 def build_group_system_prompt(character: str) -> str:
-    base = build_system_prompt(character, "聊天")
+    user_prompt = get_user_prompt_text(st.session_state.user_id)
+    base = build_system_prompt(character, "聊天", user_prompt=user_prompt)
     group_hint = (
         "\n你在一个群聊里，成员有：芙宁娜、胡桃、宵宫、用户。"
         f"你是{character}，只代表自己发言，不要替别人说话。"
@@ -1420,7 +1612,7 @@ def get_group_ai_reply(character: str, history: list[dict]) -> list[str]:
 
     system_prompt = build_group_system_prompt(character)
     messages = [{"role": "system", "content": system_prompt}]
-    for m in history[-20:]:
+    for m in history[-14:]:
         speaker = m.get("speaker", "")
         content = m.get("content", "")
         if speaker == "user":
@@ -1439,7 +1631,7 @@ def get_group_proactive_message(character: str, history: list[dict]) -> list[str
         return [f"（测试模式）{character} 先说一句。"]
     system_prompt = build_group_system_prompt(character)
     messages = [{"role": "system", "content": system_prompt}]
-    for m in history[-12:]:
+    for m in history[-10:]:
         speaker = m.get("speaker", "")
         content = m.get("content", "")
         if speaker == "user":
@@ -1453,9 +1645,10 @@ def get_group_proactive_message(character: str, history: list[dict]) -> list[str
 
 
 def get_proactive_message(character: str, history: list[dict], sexy_mode: bool = False) -> list[str]:
-    system_prompt = build_system_prompt(character, "聊天", sexy_mode=sexy_mode)
+    user_prompt = get_user_prompt_text(st.session_state.user_id)
+    system_prompt = build_system_prompt(character, "聊天", sexy_mode=sexy_mode, user_prompt=user_prompt)
     messages = [{"role": "system", "content": system_prompt}]
-    for m in history[-10:]:
+    for m in history[-8:]:
         messages.append({"role": m["role"], "content": m["content"]})
     messages.append({"role": "user", "content": "请主动发起微信开场。仍按 JSON 数组输出，1-2条短消息。"})
     raw = call_openai(messages, s_float("TEMP_CHAT", 1.05))
@@ -1555,6 +1748,24 @@ if st.session_state.get("is_admin"):
             else:
                 st.sidebar.caption("暂无聊天记录。")
 
+            st.sidebar.markdown("**用户上下文 Prompt（自动更新，可手动改）**")
+            prompt_record = get_user_prompt_record(selected_user_id) or {}
+            last_summary_at = prompt_record.get("last_summary_at")
+            last_summary_label = "无"
+            if isinstance(last_summary_at, datetime):
+                last_summary_label = last_summary_at.astimezone(LA_TZ).strftime("%Y-%m-%d %H:%M")
+            st.sidebar.caption(f"最近自动更新：{last_summary_label}")
+            edited_prompt = st.sidebar.text_area(
+                "用户 Prompt",
+                value=str(prompt_record.get("prompt") or ""),
+                height=120,
+                key=f"user_prompt_{selected_user_id}",
+            )
+            if st.sidebar.button("保存用户 Prompt", key=f"save_user_prompt_{selected_user_id}"):
+                upsert_user_prompt(selected_user_id, edited_prompt.strip())
+                st.sidebar.success("已保存用户 Prompt。")
+                st.rerun()
+
     st.sidebar.markdown("#### 头像管理（含 user）")
     target = st.sidebar.selectbox("选择要修改头像的对象", ["user"] + list(CHARACTERS.keys()))
     cur = DB_AVATARS.get(target)
@@ -1591,10 +1802,21 @@ if st.session_state.get("is_admin"):
     prompt_chat = st.sidebar.text_area("聊天模式追加 Prompt", value=SETTINGS.get("PROMPT_CHAT_EXTRA", ""), height=120)
     prompt_teach = st.sidebar.text_area("教学模式追加 Prompt", value=SETTINGS.get("PROMPT_TEACH_EXTRA", ""), height=120)
 
+    st.sidebar.markdown("#### 上下文压缩（自动记忆）")
+    summary_min = st.sidebar.slider("触发最少对话数", 1, 10, s_int("SUMMARY_MIN_COUNT", 3))
+    summary_max = st.sidebar.slider("触发最多对话数", summary_min, 12, s_int("SUMMARY_MAX_COUNT", 5))
+    summary_chars = st.sidebar.slider("摘要最大字数", 80, 400, s_int("SUMMARY_MAX_CHARS", 220), step=10)
+
     st.sidebar.markdown("#### 主动聊天（管理员可控）")
     proactive_enabled = st.sidebar.checkbox("启用主动聊天", value=s_bool("PROACTIVE_ENABLED", True))
     proactive_interval = st.sidebar.slider("最短间隔（分钟）", 1, 180, s_int("PROACTIVE_MIN_INTERVAL_MIN", 20))
     proactive_prob = st.sidebar.slider("触发概率（%）", 0, 100, s_int("PROACTIVE_PROB_PCT", 25))
+    proactive_idle_min = st.sidebar.slider(
+        "用户静默多久才允许主动（分钟）",
+        1,
+        180,
+        s_int("PROACTIVE_MIN_USER_IDLE_MIN", 5),
+    )
     proactive_now = st.sidebar.button("让 TA 立刻主动说一句")
 
     st.sidebar.markdown("#### 时间分割条")
@@ -1611,9 +1833,13 @@ if st.session_state.get("is_admin"):
         upsert_setting("FREQUENCY_PENALTY", str(freq))
         upsert_setting("PROMPT_CHAT_EXTRA", prompt_chat)
         upsert_setting("PROMPT_TEACH_EXTRA", prompt_teach)
+        upsert_setting("SUMMARY_MIN_COUNT", str(summary_min))
+        upsert_setting("SUMMARY_MAX_COUNT", str(summary_max))
+        upsert_setting("SUMMARY_MAX_CHARS", str(summary_chars))
         upsert_setting("PROACTIVE_ENABLED", "1" if proactive_enabled else "0")
         upsert_setting("PROACTIVE_MIN_INTERVAL_MIN", str(proactive_interval))
         upsert_setting("PROACTIVE_PROB_PCT", str(proactive_prob))
+        upsert_setting("PROACTIVE_MIN_USER_IDLE_MIN", str(proactive_idle_min))
         upsert_setting("TIME_DIVIDER_GRANULARITY", gran)
         st.sidebar.success("设置已保存（Neon）。")
         st.rerun()
@@ -1804,6 +2030,7 @@ def process_group_pending():
     for item in sorted(ready, key=lambda x: x.get("due_ts", 0)):
         save_group_message(item["speaker"], item.get("role", "assistant"), item["content"])
     st.session_state.group_pending = remaining
+    maybe_update_user_prompt(st.session_state.user_id)
 
 
 # =========================
@@ -1831,13 +2058,16 @@ if character != GROUP_CHAT and st.session_state.mode == "聊天" and s_bool("PRO
     now_ts = time.time()
     interval_min = s_int("PROACTIVE_MIN_INTERVAL_MIN", 20)
     prob_pct = s_int("PROACTIVE_PROB_PCT", 25)
+    idle_min = s_int("PROACTIVE_MIN_USER_IDLE_MIN", 5)
+    last_user_ts = get_last_user_message_ts(history)
     if now_ts - last_ts >= interval_min * 60:
-        st.session_state[last_key] = now_ts
-        if random.randint(1, 100) <= prob_pct:
-            msgs = get_proactive_message(character, history, sexy_mode=is_sexy_mode(character))
-            for m in msgs:
-                save_message(character, "assistant", m)
-            st.rerun()
+        if last_user_ts is None or (now_ts - last_user_ts >= idle_min * 60):
+            st.session_state[last_key] = now_ts
+            if random.randint(1, 100) <= prob_pct:
+                msgs = get_proactive_message(character, history, sexy_mode=is_sexy_mode(character))
+                for m in msgs:
+                    save_message(character, "assistant", m)
+                st.rerun()
 
 
 # =========================
@@ -1883,6 +2113,8 @@ def maybe_finish_pending():
     replies = get_ai_reply(ch, hist, last_user, mode, sexy_mode=is_sexy_mode(ch), attachments=attachments)
     for r in replies:
         save_message(ch, "assistant", r)
+
+    maybe_update_user_prompt(st.session_state.user_id)
 
     st.session_state.pending = None
     st.rerun()
