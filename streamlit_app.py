@@ -61,6 +61,12 @@ DEFAULT_SETTINGS = {
 }
 
 DEFAULT_USAGE_LIMIT = 200
+AFFINITY_DEFAULT = 30
+AFFINITY_MIN = 0
+AFFINITY_MAX = 120
+AFFINITY_SEXY_THRESHOLD = 100
+AFFINITY_ANGRY_THRESHOLD = 20
+AFFINITY_RECOVER_AMOUNT = 10
 
 
 # =========================
@@ -436,6 +442,16 @@ def ensure_tables_safe():
                 updated_at {ts_type} NOT NULL DEFAULT {ts_default}
             );
         """))
+        s.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS user_affinity (
+                user_id INTEGER NOT NULL,
+                character TEXT NOT NULL,
+                score INTEGER NOT NULL DEFAULT {AFFINITY_DEFAULT},
+                last_recovered_at {ts_type},
+                updated_at {ts_type} NOT NULL DEFAULT {ts_default},
+                PRIMARY KEY (user_id, character)
+            );
+        """))
         s.commit()
 
 
@@ -522,6 +538,23 @@ def update_user_limit(user_id: int, limit: int):
         s.commit()
 
 
+def delete_user_account(user_id: int):
+    q_list = [
+        text("DELETE FROM chat_messages_v2 WHERE user_id = :uid"),
+        text("DELETE FROM group_messages_v2 WHERE user_id = :uid"),
+        text("DELETE FROM user_usage WHERE user_id = :uid"),
+        text("DELETE FROM user_context_prompts WHERE user_id = :uid"),
+        text("DELETE FROM user_affinity WHERE user_id = :uid"),
+        text("DELETE FROM chat_messages WHERE session_id = CAST(:uid AS TEXT)"),
+        text("DELETE FROM group_messages WHERE session_id = CAST(:uid AS TEXT)"),
+        text("DELETE FROM users WHERE id = :uid"),
+    ]
+    with get_conn().session as s:
+        for q in q_list:
+            s.execute(q, {"uid": user_id})
+        s.commit()
+
+
 def get_user_summary(user_id: int):
     df = get_conn().query(
         "SELECT id, username, usage_limit, is_banned FROM users WHERE id = :uid LIMIT 1",
@@ -531,6 +564,102 @@ def get_user_summary(user_id: int):
     if df.empty:
         return None
     return df.iloc[0].to_dict()
+
+
+def ensure_affinity_record(user_id: int, character: str):
+    q = text("""
+        INSERT INTO user_affinity (user_id, character, score)
+        VALUES (:uid, :ch, :score)
+        ON CONFLICT (user_id, character) DO NOTHING
+    """)
+    with get_conn().session as s:
+        s.execute(q, {"uid": user_id, "ch": character, "score": AFFINITY_DEFAULT})
+        s.commit()
+
+
+def get_affinity_record(user_id: int, character: str) -> dict:
+    ensure_affinity_record(user_id, character)
+    df = get_conn().query(
+        """
+        SELECT user_id, character, score, last_recovered_at, updated_at
+        FROM user_affinity
+        WHERE user_id = :uid AND character = :ch
+        LIMIT 1
+        """,
+        params={"uid": user_id, "ch": character},
+        ttl=0,
+    )
+    if df.empty:
+        return {
+            "user_id": user_id,
+            "character": character,
+            "score": AFFINITY_DEFAULT,
+            "last_recovered_at": None,
+        }
+    row = df.iloc[0].to_dict()
+    for key in ["last_recovered_at", "updated_at"]:
+        val = row.get(key)
+        if isinstance(val, str):
+            try:
+                row[key] = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            except Exception:
+                row[key] = None
+    return row
+
+
+def clamp_affinity(score: int) -> int:
+    return max(AFFINITY_MIN, min(AFFINITY_MAX, int(score)))
+
+
+def maybe_recover_affinity(user_id: int, character: str) -> int:
+    record = get_affinity_record(user_id, character)
+    score = int(record.get("score") or AFFINITY_DEFAULT)
+    if score >= AFFINITY_ANGRY_THRESHOLD:
+        return score
+    last_recovered_at = record.get("last_recovered_at")
+    now = datetime.now(timezone.utc)
+    if isinstance(last_recovered_at, datetime):
+        if last_recovered_at.date() >= now.date():
+            return score
+    new_score = clamp_affinity(score + AFFINITY_RECOVER_AMOUNT)
+    q = text("""
+        UPDATE user_affinity
+        SET score = :score,
+            last_recovered_at = :lra,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = :uid AND character = :ch
+    """)
+    with get_conn().session as s:
+        s.execute(q, {"score": new_score, "lra": now, "uid": user_id, "ch": character})
+        s.commit()
+    return new_score
+
+
+def update_affinity(user_id: int, character: str, delta: int = 0, absolute: int | None = None) -> int:
+    record = get_affinity_record(user_id, character)
+    current = int(record.get("score") or AFFINITY_DEFAULT)
+    new_score = clamp_affinity(absolute if absolute is not None else current + delta)
+    q = text("""
+        UPDATE user_affinity
+        SET score = :score,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = :uid AND character = :ch
+    """)
+    with get_conn().session as s:
+        s.execute(q, {"score": new_score, "uid": user_id, "ch": character})
+        s.commit()
+    return new_score
+
+
+def evaluate_affinity_delta(user_text: str) -> int:
+    text_val = (user_text or "").lower()
+    negative_keywords = ["讨厌", "烦", "滚", "别理", "拉黑", "生气", "你走", "笨", "蠢", "死"]
+    positive_keywords = ["谢谢", "喜欢", "爱", "开心", "高兴", "抱抱", "加油", "赞", "好棒"]
+    if any(k in text_val for k in negative_keywords):
+        return random.randint(-8, -4)
+    if any(k in text_val for k in positive_keywords):
+        return random.randint(2, 5)
+    return random.randint(-1, 2)
 
 
 def get_user_usage(user_id: int, week_id: str) -> int:
@@ -749,6 +878,8 @@ if "group_random_fired" not in st.session_state:
     st.session_state.group_random_fired = False
 if "group_pending" not in st.session_state:
     st.session_state.group_pending = []
+if "pending_queue" not in st.session_state:
+    st.session_state.pending_queue = {}
 
 
 # =========================
@@ -765,6 +896,15 @@ current_limit = int(user_summary.get("usage_limit") or DEFAULT_USAGE_LIMIT)
 
 st.sidebar.markdown(f"**当前用户：{_html.escape(str(user_summary.get('username', '')))}**")
 st.sidebar.markdown(f"AI 使用量：{current_used}/{current_limit}（{current_week}）")
+
+with st.sidebar.expander("账号管理", expanded=False):
+    st.caption("注销账号会永久删除你的聊天记录、好感度与账号信息。")
+    confirm_delete = st.checkbox("我确认要注销账号", value=False)
+    if st.button("注销账号", type="primary", disabled=(not confirm_delete)):
+        delete_user_account(st.session_state.user_id)
+        st.success("账号已注销。")
+        st.session_state.clear()
+        st.rerun()
 
 
 # =========================
@@ -1445,6 +1585,26 @@ def render_typing(character: str):
     st.markdown(html_block, unsafe_allow_html=True)
 
 
+def render_group_typing(speaker: str):
+    avatar = avatar_for("assistant", speaker)
+    safe_name = _html.escape(speaker)
+    html_block = f"""
+    <div class="wx-row bot">
+        {_avatar_html(avatar)}
+        <div>
+            <div class="wx-name">{safe_name}</div>
+            <div class="wx-bubble bot">
+                <div class="typing">
+                    <div>对方正在输入</div>
+                    <div class="dots"><span></span><span></span><span></span></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    """
+    st.markdown(html_block, unsafe_allow_html=True)
+
+
 def render_history_manager(current_character: str):
     st.sidebar.divider()
     with st.sidebar.expander("聊天记录管理", expanded=False):
@@ -1512,7 +1672,7 @@ def build_system_prompt(character: str, mode: str, sexy_mode: bool = False, user
         "你现在进入【聊天模式】。\n"
         "要求：像真实微信聊天，不要AI味；句子自然；可以有情绪；不要长篇论文；避免‘作为AI’。\n"
         "输出格式：只输出一个 JSON 数组，例如 [\"消息1\",\"消息2\"]。\n"
-        "规则：数组1-5条（条数随机）；每条1-2句话；每条尽量短（像微信）；不要输出除 JSON 外任何文字。"
+        "规则：数组1-5条（条数随机）；每条1-3句话（随机）；每条尽量短（像微信）；不要输出除 JSON 外任何文字。"
     )
     extra = SETTINGS.get("PROMPT_CHAT_EXTRA", "")
     return base_persona + context_hint + "\n" + chat_core + sexy_core + ("\n" + extra if extra else "")
@@ -1542,6 +1702,32 @@ def parse_chat_messages(raw: str, max_messages: int = 5) -> list[str]:
         pass
     parts = [p.strip() for p in re.split(r"\n+|---+|•|\u2022", raw) if p.strip()]
     return parts[:max_messages]
+
+
+def split_sentences(text: str) -> list[str]:
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    parts = re.split(r"(?<=[。！？!?])\s*|\n+", raw)
+    sentences = [p.strip() for p in parts if p.strip()]
+    return sentences or [raw]
+
+
+def split_into_message_chunks(messages: list[str], min_sentences: int = 1, max_sentences: int = 2) -> list[str]:
+    sentences = []
+    for msg in messages:
+        sentences.extend(split_sentences(msg))
+    if not sentences:
+        return []
+    chunks = []
+    idx = 0
+    while idx < len(sentences):
+        size = random.randint(min_sentences, max_sentences)
+        chunk = " ".join(sentences[idx: idx + size]).strip()
+        if chunk:
+            chunks.append(chunk)
+        idx += size
+    return chunks
 
 
 def pick_random_messages(messages: list[str], min_count: int = 1, max_count: int = 5) -> list[str]:
@@ -1591,7 +1777,9 @@ def get_ai_reply(
     if mode == "教学":
         return [raw.strip()]
 
-    msgs = pick_random_messages(parse_chat_messages(raw))
+    parsed = parse_chat_messages(raw)
+    chunks = split_into_message_chunks(parsed, min_sentences=1, max_sentences=2)
+    msgs = pick_random_messages(chunks)
     return msgs if msgs else [raw.strip() or "嗯？"]
 
 
@@ -1622,7 +1810,8 @@ def get_group_ai_reply(character: str, history: list[dict]) -> list[str]:
     messages.append({"role": "user", "content": "请在群聊中回复上一条消息。"})
 
     raw = call_openai(messages, s_float("TEMP_CHAT", 1.05))
-    msgs = parse_chat_messages(raw)
+    parsed = parse_chat_messages(raw)
+    msgs = split_into_message_chunks(parsed, min_sentences=1, max_sentences=2)
     return msgs if msgs else [raw.strip() or "嗯？"]
 
 
@@ -1640,7 +1829,8 @@ def get_group_proactive_message(character: str, history: list[dict]) -> list[str
             messages.append({"role": "assistant", "content": f"{speaker}：{content}"})
     messages.append({"role": "user", "content": "请你在群聊里先开个话题，1-2条短消息。"})
     raw = call_openai(messages, s_float("TEMP_CHAT", 1.05))
-    msgs = parse_chat_messages(raw)
+    parsed = parse_chat_messages(raw)
+    msgs = split_into_message_chunks(parsed, min_sentences=1, max_sentences=2)
     return msgs[:2] if msgs else ["在吗？"]
 
 
@@ -1652,7 +1842,8 @@ def get_proactive_message(character: str, history: list[dict], sexy_mode: bool =
         messages.append({"role": m["role"], "content": m["content"]})
     messages.append({"role": "user", "content": "请主动发起微信开场。仍按 JSON 数组输出，1-2条短消息。"})
     raw = call_openai(messages, s_float("TEMP_CHAT", 1.05))
-    msgs = parse_chat_messages(raw)
+    parsed = parse_chat_messages(raw)
+    msgs = split_into_message_chunks(parsed, min_sentences=1, max_sentences=2)
     return msgs[:2] if msgs else ["在吗？"]
 
 
@@ -1764,6 +1955,26 @@ if st.session_state.get("is_admin"):
             if st.sidebar.button("保存用户 Prompt", key=f"save_user_prompt_{selected_user_id}"):
                 upsert_user_prompt(selected_user_id, edited_prompt.strip())
                 st.sidebar.success("已保存用户 Prompt。")
+                st.rerun()
+
+            st.sidebar.markdown("**用户好感度**")
+            affinity_character = st.sidebar.selectbox(
+                "选择好友",
+                list(CHARACTERS.keys()),
+                key=f"affinity_character_{selected_user_id}",
+            )
+            affinity_record = get_affinity_record(selected_user_id, affinity_character)
+            affinity_value = int(affinity_record.get("score") or AFFINITY_DEFAULT)
+            new_affinity_value = st.sidebar.slider(
+                "调整好感度",
+                AFFINITY_MIN,
+                AFFINITY_MAX,
+                affinity_value,
+                key=f"affinity_slider_{selected_user_id}_{affinity_character}",
+            )
+            if st.sidebar.button("保存好感度", key=f"save_affinity_{selected_user_id}_{affinity_character}"):
+                update_affinity(selected_user_id, affinity_character, absolute=new_affinity_value)
+                st.sidebar.success("好感度已更新。")
                 st.rerun()
 
     st.sidebar.markdown("#### 头像管理（含 user）")
@@ -1965,6 +2176,12 @@ with colB:
         st.markdown('<div class="wx-pill">模式：色色</div>', unsafe_allow_html=True)
     else:
         st.markdown(f'<div class="wx-pill">模式：{mode}</div>', unsafe_allow_html=True)
+    if character != GROUP_CHAT:
+        affinity_score = maybe_recover_affinity(st.session_state.user_id, character)
+        st.markdown(
+            f'<div class="wx-pill">好感度：{affinity_score}/{AFFINITY_MAX}</div>',
+            unsafe_allow_html=True,
+        )
 
 if st.session_state.mode == GROUP_CHAT:
     st.session_state.selected_character = GROUP_CHAT
@@ -2003,6 +2220,37 @@ def queue_group_messages(speaker: str, messages: list[str], start_delay: int | N
             {"speaker": speaker, "role": "assistant", "content": msg, "due_ts": time.time() + delay}
         )
         delay += random.randint(2, 5)
+
+
+def queue_direct_messages(character: str, messages: list[str], start_delay: int | None = None):
+    if not messages:
+        return
+    if "pending_queue" not in st.session_state:
+        st.session_state.pending_queue = {}
+    queue = st.session_state.pending_queue.get(character, [])
+    delay = start_delay if start_delay is not None else random.randint(1, 4)
+    for msg in messages:
+        queue.append({"content": msg, "due_ts": time.time() + delay})
+        delay += random.randint(1, 4)
+    st.session_state.pending_queue[character] = queue
+
+
+def process_pending_messages(character: str):
+    queue_map = st.session_state.get("pending_queue", {})
+    queue = queue_map.get(character, [])
+    if not queue:
+        return
+    now_ts = time.time()
+    ready = [p for p in queue if p.get("due_ts", 0) <= now_ts]
+    if not ready:
+        return
+    remaining = [p for p in queue if p.get("due_ts", 0) > now_ts]
+    for item in sorted(ready, key=lambda x: x.get("due_ts", 0)):
+        save_message(character, "assistant", item["content"])
+    queue_map[character] = remaining
+    st.session_state.pending_queue = queue_map
+    maybe_update_user_prompt(st.session_state.user_id)
+    st.rerun()
 
 
 def maybe_trigger_group_random_chat():
@@ -2044,6 +2292,8 @@ else:
 maybe_trigger_random_chat()
 maybe_trigger_group_random_chat()
 process_group_pending()
+if character != GROUP_CHAT:
+    process_pending_messages(character)
 
 if character != GROUP_CHAT and proactive_now:
     rate_limit(1.0, 600)
@@ -2074,7 +2324,7 @@ if character != GROUP_CHAT and st.session_state.mode == "聊天" and s_bool("PRO
 # “正在输入”延迟回复
 # =========================
 def start_pending_reply(character: str, mode: str, attachments: list[dict] | None = None):
-    delay = random.randint(1, 5)
+    delay = random.randint(1, 4)
     st.session_state.pending = {
         "character": character,
         "mode": mode,
@@ -2085,7 +2335,10 @@ def start_pending_reply(character: str, mode: str, attachments: list[dict] | Non
 
 def has_pending_for(character: str) -> bool:
     p = st.session_state.get("pending")
-    return bool(p) and p.get("character") == character
+    if bool(p) and p.get("character") == character:
+        return True
+    queue_map = st.session_state.get("pending_queue", {})
+    return bool(queue_map.get(character))
 
 
 def maybe_finish_pending():
@@ -2111,8 +2364,7 @@ def maybe_finish_pending():
 
     rate_limit(1.0, 600)
     replies = get_ai_reply(ch, hist, last_user, mode, sexy_mode=is_sexy_mode(ch), attachments=attachments)
-    for r in replies:
-        save_message(ch, "assistant", r)
+    queue_direct_messages(ch, replies, start_delay=random.randint(1, 4))
 
     maybe_update_user_prompt(st.session_state.user_id)
 
@@ -2145,6 +2397,9 @@ for msg in history:
 
 if character != GROUP_CHAT and has_pending_for(character):
     render_typing(character)
+if character == GROUP_CHAT and st.session_state.get("group_pending"):
+    next_pending = sorted(st.session_state.group_pending, key=lambda x: x.get("due_ts", 0))[0]
+    render_group_typing(next_pending.get("speaker", ""))
 
 st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2200,14 +2455,25 @@ if user_text:
         st.rerun()
     else:
         normalized = user_text.strip()
-        if normalized in ("打开色色模式", "关闭色色模式"):
-            set_sexy_mode(character, normalized == "打开色色模式")
+        current_affinity = maybe_recover_affinity(st.session_state.user_id, character)
+        if current_affinity < AFFINITY_ANGRY_THRESHOLD:
             save_message(character, "user", user_text)
-            reply = "已开启色色模式。" if normalized == "打开色色模式" else "已关闭色色模式。"
+            save_message(character, "assistant", f"「{character}」生气了，暂时不想回复你。")
+            mark_seen(character)
+            st.rerun()
+        if normalized in ("打开色色模式", "关闭色色模式"):
+            save_message(character, "user", user_text)
+            if normalized == "打开色色模式" and current_affinity < AFFINITY_SEXY_THRESHOLD:
+                reply = f"好感度达到 {AFFINITY_SEXY_THRESHOLD} 才能开启色色模式。"
+            else:
+                set_sexy_mode(character, normalized == "打开色色模式")
+                reply = "已开启色色模式。" if normalized == "打开色色模式" else "已关闭色色模式。"
             save_message(character, "assistant", reply)
             mark_seen(character)
             st.session_state.mode = "聊天"
             st.rerun()
+        delta = evaluate_affinity_delta(user_text)
+        update_affinity(st.session_state.user_id, character, delta=delta)
         attachments = []
         if st.session_state.mode == "教学" and teach_uploads:
             attachments = build_teaching_attachments(teach_uploads)
