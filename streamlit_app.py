@@ -246,6 +246,38 @@ div[data-testid="stChatInput"]{
   z-index: 10;
 }
 
+/* 好感度能量条 */
+.affinity-wrap {
+  max-width: 940px;
+  margin: 4px auto 8px auto;
+  padding: 6px 10px 0 10px;
+}
+.affinity-label {
+  font-size: 12px;
+  color: rgba(0,0,0,.6);
+  margin-bottom: 6px;
+}
+.affinity-bar {
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(255, 122, 187, 0.25);
+  border: 1px solid rgba(255, 122, 187, 0.5);
+  overflow: hidden;
+}
+.affinity-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #ff7abf 0%, #ff4f9a 100%);
+  border-radius: 999px;
+}
+.affinity-scale {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: rgba(0,0,0,.45);
+  margin-top: 4px;
+}
+
 /* 正在输入… */
 .typing {
   display:flex; gap:6px; align-items:center;
@@ -651,7 +683,22 @@ def update_affinity(user_id: int, character: str, delta: int = 0, absolute: int 
     return new_score
 
 
-def evaluate_affinity_delta(user_text: str) -> int:
+def build_affinity_prompt(character: str, current_score: int, user_text: str) -> str:
+    return (
+        "你是恋爱游戏的好感度裁定器，风格参考 galgame。\n"
+        f"角色：{character}\n"
+        f"当前好感度：{current_score}\n"
+        "根据用户发言判断好感度变化幅度，输出一个整数。\n"
+        "规则：\n"
+        "1) 只输出一个整数，不要任何额外文字。\n"
+        "2) 范围 -8 到 8（含）。\n"
+        "3) 赞美、体贴、关心、道歉、约会等 -> 增加；侮辱、冷漠、命令、失礼 -> 减少。\n"
+        "4) 语气中性就小幅波动（-1~2）。\n"
+        f"用户发言：{user_text}"
+    )
+
+
+def _evaluate_affinity_delta_rule(user_text: str) -> int:
     text_val = (user_text or "").lower()
     negative_keywords = ["讨厌", "烦", "滚", "别理", "拉黑", "生气", "你走", "笨", "蠢", "死"]
     positive_keywords = ["谢谢", "喜欢", "爱", "开心", "高兴", "抱抱", "加油", "赞", "好棒"]
@@ -660,6 +707,27 @@ def evaluate_affinity_delta(user_text: str) -> int:
     if any(k in text_val for k in positive_keywords):
         return random.randint(2, 5)
     return random.randint(-1, 2)
+
+
+def evaluate_affinity_delta(user_text: str, character: str, current_score: int) -> int:
+    if "OPENAI_API_KEY" not in st.secrets:
+        return _evaluate_affinity_delta_rule(user_text)
+    prompt = build_affinity_prompt(character, current_score, user_text)
+    try:
+        raw = call_openai(
+            [
+                {"role": "system", "content": "你只输出一个整数。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+        )
+    except Exception:
+        return _evaluate_affinity_delta_rule(user_text)
+    match = re.search(r"-?\d+", str(raw))
+    if not match:
+        return _evaluate_affinity_delta_rule(user_text)
+    value = int(match.group(0))
+    return max(-8, min(8, value))
 
 
 def get_user_usage(user_id: int, week_id: str) -> int:
@@ -1511,6 +1579,25 @@ def render_time_divider(label: str):
 # =========================
 # 微信消息渲染
 # =========================
+def render_affinity_bar(character: str, score: int):
+    max_val = AFFINITY_MAX
+    min_val = 1
+    display_score = max(min_val, min(max_val, int(score)))
+    pct = int(display_score / max_val * 100)
+    st.markdown(
+        f"""
+        <div class="affinity-wrap">
+          <div class="affinity-label">好感度能量条：{display_score}/{max_val}</div>
+          <div class="affinity-bar">
+            <div class="affinity-fill" style="width:{pct}%;"></div>
+          </div>
+          <div class="affinity-scale"><span>{min_val}</span><span>{max_val}</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _avatar_html(avatar):
     if isinstance(avatar, str) and avatar.startswith("data:"):
         return f'<div class="wx-avatar"><img src="{avatar}" /></div>'
@@ -2162,6 +2249,7 @@ for ch in CHARACTERS.keys():
 character = st.session_state.selected_character
 
 colA, colB = st.columns([4, 1])
+affinity_score = None
 with colA:
     if character == GROUP_CHAT or st.session_state.mode == GROUP_CHAT:
         st.markdown(f'<div class="wx-title">{_html.escape(GROUP_DISPLAY_NAME)}</div>', unsafe_allow_html=True)
@@ -2196,6 +2284,9 @@ if character == GROUP_CHAT:
     GROUP_DISPLAY_NAME = SETTINGS.get("GROUP_NAME", GROUP_CHAT)
 
 render_history_manager(character)
+
+if character != GROUP_CHAT and affinity_score is not None:
+    render_affinity_bar(character, affinity_score)
 
 
 def maybe_trigger_random_chat():
@@ -2458,7 +2549,7 @@ if user_text:
         current_affinity = maybe_recover_affinity(st.session_state.user_id, character)
         if current_affinity < AFFINITY_ANGRY_THRESHOLD:
             save_message(character, "user", user_text)
-            save_message(character, "assistant", f"「{character}」生气了，暂时不想回复你。")
+            save_message(character, "assistant", f"「{character}」生气了，不理你了。")
             mark_seen(character)
             st.rerun()
         if normalized in ("打开色色模式", "关闭色色模式"):
@@ -2472,7 +2563,7 @@ if user_text:
             mark_seen(character)
             st.session_state.mode = "聊天"
             st.rerun()
-        delta = evaluate_affinity_delta(user_text)
+        delta = evaluate_affinity_delta(user_text, character, current_affinity)
         update_affinity(st.session_state.user_id, character, delta=delta)
         attachments = []
         if st.session_state.mode == "教学" and teach_uploads:
