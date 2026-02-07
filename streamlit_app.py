@@ -287,6 +287,13 @@ def weekly_code_hmac(seed: str, week_id: str) -> str:
 # DB：延迟初始化（登录后才连）
 # =========================
 conn = None
+DB_AVAILABLE = False
+DB_ERROR = None
+
+
+def is_db_configured() -> bool:
+    connections = st.secrets.get("connections", {})
+    return isinstance(connections, dict) and "neon" in connections
 
 
 class LocalSQLiteConnection:
@@ -312,6 +319,13 @@ def get_conn():
             st.warning("未检测到数据库连接配置，已切换到本地 SQLite（仅当前环境生效）。")
             conn = LocalSQLiteConnection("local_chat.db")
     return conn
+
+
+def get_memory_store() -> dict:
+    return st.session_state.setdefault(
+        "_mem_store",
+        {"messages": [], "avatars": {}, "settings": {}, "weekly_codes": {}, "seq": 0},
+    )
 
 
 def ensure_tables_safe():
@@ -378,6 +392,10 @@ def ensure_tables_safe():
 
 
 def get_override_code_db(week_id: str) -> str | None:
+    if not DB_AVAILABLE:
+        store = get_memory_store()
+        code = store["weekly_codes"].get(week_id)
+        return code.strip().upper() if isinstance(code, str) and code.strip() else None
     try:
         df = get_conn().query(
             "SELECT code FROM weekly_access_overrides WHERE week_id = :w LIMIT 1",
@@ -393,6 +411,10 @@ def get_override_code_db(week_id: str) -> str | None:
 
 def reset_override_code_db(week_id: str) -> str:
     new_code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
+    if not DB_AVAILABLE:
+        store = get_memory_store()
+        store["weekly_codes"][week_id] = new_code
+        return new_code
     q = text("""
         INSERT INTO weekly_access_overrides (week_id, code)
         VALUES (:w, :c)
@@ -495,12 +517,21 @@ def rate_limit(min_interval_sec: float = 1.4, max_per_day: int = 400):
 require_gate()
 
 # 登录后初始化 DB
-try:
-    ensure_tables_safe()
-except Exception as e:
-    st.error("数据库连接失败（Neon）。请点右下角 Manage app → Logs 看真实原因。")
-    st.exception(e)
-    st.stop()
+if is_db_configured():
+    try:
+        ensure_tables_safe()
+        DB_AVAILABLE = True
+    except Exception as e:
+        DB_ERROR = e
+        DB_AVAILABLE = False
+else:
+    DB_AVAILABLE = False
+
+if not DB_AVAILABLE:
+    st.warning("数据库未配置或不可用，当前使用临时内存存储（刷新后会清空）。")
+    if DB_ERROR:
+        with st.expander("数据库错误详情"):
+            st.exception(DB_ERROR)
 
 
 # session id
@@ -543,14 +574,22 @@ if "group_pending" not in st.session_state:
 # Settings（DB）
 # =========================
 def load_settings() -> dict:
-    df = get_conn().query("SELECT key, value FROM app_settings", ttl=0)
     s = dict(DEFAULT_SETTINGS)
+    if not DB_AVAILABLE:
+        store = get_memory_store()
+        s.update(store["settings"])
+        return s
+    df = get_conn().query("SELECT key, value FROM app_settings", ttl=0)
     for _, row in df.iterrows():
         s[str(row["key"])] = str(row["value"])
     return s
 
 
 def upsert_setting(key: str, value: str):
+    if not DB_AVAILABLE:
+        store = get_memory_store()
+        store["settings"][key] = value
+        return
     q = text("""
         INSERT INTO app_settings (key, value)
         VALUES (:k, :v)
@@ -691,6 +730,13 @@ def build_teaching_attachments(uploaded_files: list) -> list[dict]:
 
 
 def upsert_avatar(key_name: str, avatar_data_url: str | None):
+    if not DB_AVAILABLE:
+        store = get_memory_store()
+        if avatar_data_url:
+            store["avatars"][key_name] = avatar_data_url
+        else:
+            store["avatars"].pop(key_name, None)
+        return
     q = text("""
         INSERT INTO character_profiles (character, avatar_data_url)
         VALUES (:ch, :url)
@@ -704,6 +750,9 @@ def upsert_avatar(key_name: str, avatar_data_url: str | None):
 
 
 def get_avatars_from_db() -> dict:
+    if not DB_AVAILABLE:
+        store = get_memory_store()
+        return dict(store["avatars"])
     df = get_conn().query("SELECT character, avatar_data_url FROM character_profiles", ttl=0)
     avatars = {}
     for _, row in df.iterrows():
@@ -725,6 +774,13 @@ def avatar_for(role: str, character: str):
 # DB：消息读写
 # =========================
 def load_messages(character: str):
+    if not DB_AVAILABLE:
+        store = get_memory_store()
+        return [
+            msg
+            for msg in store["messages"]
+            if msg["session_id"] == st.session_state.session_id and msg["character"] == character
+        ]
     q = """
         SELECT id, role, content, created_at
         FROM chat_messages
@@ -744,6 +800,20 @@ def load_messages(character: str):
 
 
 def save_message(character: str, role: str, content: str):
+    if not DB_AVAILABLE:
+        store = get_memory_store()
+        store["seq"] += 1
+        store["messages"].append(
+            {
+                "id": store["seq"],
+                "session_id": st.session_state.session_id,
+                "character": character,
+                "role": role,
+                "content": content,
+                "created_at": datetime.now(timezone.utc),
+            }
+        )
+        return
     q = text("""
         INSERT INTO chat_messages (session_id, character, role, content)
         VALUES (:sid, :ch, :role, :content)
@@ -754,6 +824,9 @@ def save_message(character: str, role: str, content: str):
 
 
 def get_latest_message_meta(character: str):
+    if not DB_AVAILABLE:
+        hist = load_messages(character)
+        return hist[-1] if hist else None
     q = """
         SELECT id, role, content, created_at
         FROM chat_messages
@@ -1260,7 +1333,8 @@ if st.session_state.get("is_admin"):
         upsert_setting("PROACTIVE_MIN_INTERVAL_MIN", str(proactive_interval))
         upsert_setting("PROACTIVE_PROB_PCT", str(proactive_prob))
         upsert_setting("TIME_DIVIDER_GRANULARITY", gran)
-        st.sidebar.success("设置已保存（Neon）。")
+        storage_hint = "Neon" if DB_AVAILABLE else "临时内存"
+        st.sidebar.success(f"设置已保存（{storage_hint}）。")
         st.rerun()
 else:
     proactive_now = False
