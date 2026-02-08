@@ -207,6 +207,9 @@ section[data-testid="stSidebar"] { background:#F7F7F7; }
   word-wrap: break-word;
   white-space: pre-wrap;
 }
+.wx-bubble p { margin: 0; }
+.wx-bubble ul, .wx-bubble ol { margin: 0.3em 0 0.3em 1.1em; }
+.wx-bubble li { margin: 0.1em 0; }
 .wx-bubble.bot { background:#FFFFFF; border:1px solid rgba(0,0,0,.06); }
 .wx-bubble.user { background:#95EC69; border:1px solid rgba(0,0,0,.03); }
 
@@ -1605,55 +1608,58 @@ def _avatar_html(avatar):
     return f'<div class="wx-avatar">{safe}</div>'
 
 
+def _message_to_markdown(content: str) -> str:
+    safe_text = (content or "").replace("<", "&lt;").replace(">", "&gt;")
+    return safe_text.replace("\n", "  \n")
+
+
 def render_message(role: str, character: str, content: str):
     is_user = (role == "user")
     avatar = avatar_for("user" if is_user else "assistant", character)
-    safe_text = _html.escape(content).replace("\n", "<br>")
+    safe_md = _message_to_markdown(content)
 
     if is_user:
-        html_block = f"""
-        <div class="wx-row user">
-            <div class="wx-bubble user">{safe_text}</div>
-            {_avatar_html(avatar)}
-        </div>
-        """
+        st.markdown('<div class="wx-row user">', unsafe_allow_html=True)
+        st.markdown('<div class="wx-bubble user">', unsafe_allow_html=True)
+        st.markdown(safe_md)
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
     else:
-        html_block = f"""
-        <div class="wx-row bot">
-            {_avatar_html(avatar)}
-            <div class="wx-bubble bot">{safe_text}</div>
-        </div>
-        """
-    st.markdown(html_block, unsafe_allow_html=True)
+        st.markdown('<div class="wx-row bot">', unsafe_allow_html=True)
+        st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
+        st.markdown('<div class="wx-bubble bot">', unsafe_allow_html=True)
+        st.markdown(safe_md)
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_group_message(role: str, speaker: str, content: str):
     is_user = (role == "user")
     avatar = avatar_for("user" if is_user else "assistant", speaker)
-    safe_text = _html.escape(content).replace("\n", "<br>")
+    safe_md = _message_to_markdown(content)
     safe_name = "你" if is_user else _html.escape(speaker)
 
     if is_user:
-        html_block = f"""
-        <div class="wx-row user">
-            <div>
-                <div class="wx-name user">{safe_name}</div>
-                <div class="wx-bubble user">{safe_text}</div>
-            </div>
-            {_avatar_html(avatar)}
-        </div>
-        """
+        st.markdown('<div class="wx-row user">', unsafe_allow_html=True)
+        st.markdown('<div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="wx-name user">{safe_name}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="wx-bubble user">', unsafe_allow_html=True)
+        st.markdown(safe_md)
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
     else:
-        html_block = f"""
-        <div class="wx-row bot">
-            {_avatar_html(avatar)}
-            <div>
-                <div class="wx-name">{safe_name}</div>
-                <div class="wx-bubble bot">{safe_text}</div>
-            </div>
-        </div>
-        """
-    st.markdown(html_block, unsafe_allow_html=True)
+        st.markdown('<div class="wx-row bot">', unsafe_allow_html=True)
+        st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
+        st.markdown('<div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="wx-name">{safe_name}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="wx-bubble bot">', unsafe_allow_html=True)
+        st.markdown(safe_md)
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_typing(character: str):
@@ -1742,7 +1748,9 @@ def build_system_prompt(character: str, mode: str, sexy_mode: bool = False, user
         teach_core = (
             "你现在进入【教学模式】。\n"
             "目标：像顶级家教一样帮助用户学习/解题。\n"
-            "要求：先澄清题目与目标；分步骤讲解；必要时反问引导；给练习与检查点；避免空话。"
+            "要求：先澄清题目与目标；分步骤讲解；必要时反问引导；给练习与检查点；避免空话。\n"
+            "数学公式显示：使用 Markdown 数学格式，行内用 \\( ... \\)，块级用 $$...$$。\n"
+            "如果用户给出的 LaTeX 片段不完整或乱码，先修正成规范公式再展示。"
         )
         extra = SETTINGS.get("PROMPT_TEACH_EXTRA", "")
         return base_persona + context_hint + "\n" + teach_core + ("\n" + extra if extra else "")
@@ -1758,6 +1766,10 @@ def build_system_prompt(character: str, mode: str, sexy_mode: bool = False, user
     chat_core = (
         "你现在进入【聊天模式】。\n"
         "要求：像真实微信聊天，不要AI味；句子自然；可以有情绪；不要长篇论文；避免‘作为AI’。\n"
+        "记忆与逻辑：优先使用【用户上下文摘要】中的关键信息，后续对话自然引用，避免每次像初次见面。\n"
+        "表达方式：避免空泛回应；结合用户话题的专业细节；情绪上先共情再分析。\n"
+        "好感度提示：当用户询问如何提升好感度时，给出3-5条可执行的泛化建议（如真诚、尊重、具体关心、积极反馈）。\n"
+        "主动聊天：避免尴尬或生硬开场，尽量基于最近话题或用户兴趣发起轻量问题。\n"
         "输出格式：只输出一个 JSON 数组，例如 [\"消息1\",\"消息2\"]。\n"
         "规则：数组1-5条（条数随机）；每条1-3句话（随机）；每条尽量短（像微信）；不要输出除 JSON 外任何文字。"
     )
@@ -1914,7 +1926,7 @@ def get_group_proactive_message(character: str, history: list[dict]) -> list[str
             messages.append({"role": "user", "content": content})
         else:
             messages.append({"role": "assistant", "content": f"{speaker}：{content}"})
-    messages.append({"role": "user", "content": "请你在群聊里先开个话题，1-2条短消息。"})
+    messages.append({"role": "user", "content": "请你在群聊里先开个话题，1-2条短消息，轻松自然不尴尬。"})
     raw = call_openai(messages, s_float("TEMP_CHAT", 1.05))
     parsed = parse_chat_messages(raw)
     msgs = split_into_message_chunks(parsed, min_sentences=1, max_sentences=2)
@@ -1927,7 +1939,7 @@ def get_proactive_message(character: str, history: list[dict], sexy_mode: bool =
     messages = [{"role": "system", "content": system_prompt}]
     for m in history[-8:]:
         messages.append({"role": m["role"], "content": m["content"]})
-    messages.append({"role": "user", "content": "请主动发起微信开场。仍按 JSON 数组输出，1-2条短消息。"})
+    messages.append({"role": "user", "content": "请主动发起微信开场，轻松自然不尴尬。仍按 JSON 数组输出，1-2条短消息。"})
     raw = call_openai(messages, s_float("TEMP_CHAT", 1.05))
     parsed = parse_chat_messages(raw)
     msgs = split_into_message_chunks(parsed, min_sentences=1, max_sentences=2)
