@@ -50,10 +50,6 @@ DEFAULT_SETTINGS = {
     "PROMPT_CHAT_EXTRA": "",
     "PROMPT_TEACH_EXTRA": "",
     "DARK_MODE": "0",
-    "TTS_ENABLED": "0",
-    "CHAT_BG": "",
-    "REMINDER_ENABLED": "0",
-    "REMINDER_TIME": "09:00",
     "PROACTIVE_ENABLED": "1",
     "PROACTIVE_MIN_INTERVAL_MIN": "20",
     "PROACTIVE_PROB_PCT": "25",
@@ -398,10 +394,6 @@ def ensure_tables_safe():
                 character TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
-                message_type TEXT NOT NULL DEFAULT 'text',
-                image_url TEXT,
-                reply_to_id INTEGER,
-                is_deleted BOOLEAN NOT NULL DEFAULT 0,
                 created_at {ts_type} NOT NULL DEFAULT {ts_default}
             );
         """))
@@ -417,10 +409,6 @@ def ensure_tables_safe():
                 speaker TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
-                message_type TEXT NOT NULL DEFAULT 'text',
-                image_url TEXT,
-                reply_to_id INTEGER,
-                is_deleted BOOLEAN NOT NULL DEFAULT 0,
                 created_at {ts_type} NOT NULL DEFAULT {ts_default}
             );
         """))
@@ -1341,9 +1329,9 @@ def avatar_for(role: str, character: str):
 def load_messages(character: str, user_id: int | None = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = """
-        SELECT id, role, content, created_at, reply_to_id, message_type, image_url
+        SELECT id, role, content, created_at
         FROM chat_messages_v2
-        WHERE user_id = :uid AND character = :ch AND is_deleted = 0
+        WHERE user_id = :uid AND character = :ch
         ORDER BY created_at
     """
     df = get_conn().query(q, params={"uid": uid, "ch": character}, ttl=0)
@@ -1358,15 +1346,14 @@ def load_messages(character: str, user_id: int | None = None):
     return recs
 
 
-def save_message(character: str, role: str, content: str, user_id: int | None = None, message_type: str = "text", image_url: str = None, reply_to_id: int = None):
+def save_message(character: str, role: str, content: str, user_id: int | None = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = text("""
-        INSERT INTO chat_messages_v2 (user_id, character, role, content, message_type, image_url, reply_to_id)
-        VALUES (:uid, :ch, :role, :content, :msg_type, :img_url, :reply_to)
+        INSERT INTO chat_messages_v2 (user_id, character, role, content)
+        VALUES (:uid, :ch, :role, :content)
     """)
     with get_conn().session as s:
-        s.execute(q, {"uid": uid, "ch": character, "role": role, "content": content, 
-                      "msg_type": message_type, "img_url": image_url, "reply_to": reply_to_id})
+        s.execute(q, {"uid": uid, "ch": character, "role": role, "content": content})
         s.commit()
 
 
@@ -1452,9 +1439,9 @@ def get_last_user_message_ts(history: list[dict]) -> float | None:
 def load_group_messages(user_id: int | None = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = """
-        SELECT id, speaker, role, content, created_at, reply_to_id, message_type, image_url
+        SELECT id, speaker, role, content, created_at
         FROM group_messages_v2
-        WHERE user_id = :uid AND is_deleted = 0
+        WHERE user_id = :uid
         ORDER BY created_at
     """
     df = get_conn().query(q, params={"uid": uid}, ttl=0)
@@ -1469,15 +1456,14 @@ def load_group_messages(user_id: int | None = None):
     return recs
 
 
-def save_group_message(speaker: str, role: str, content: str, user_id: int | None = None, message_type: str = "text", image_url: str = None, reply_to_id: int = None):
+def save_group_message(speaker: str, role: str, content: str, user_id: int | None = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = text("""
-        INSERT INTO group_messages_v2 (user_id, speaker, role, content, message_type, image_url, reply_to_id)
-        VALUES (:uid, :sp, :role, :content, :msg_type, :img_url, :reply_to)
+        INSERT INTO group_messages_v2 (user_id, speaker, role, content)
+        VALUES (:uid, :sp, :role, :content)
     """)
     with get_conn().session as s:
-        s.execute(q, {"uid": uid, "sp": speaker, "role": role, "content": content,
-                      "msg_type": message_type, "img_url": image_url, "reply_to": reply_to_id})
+        s.execute(q, {"uid": uid, "sp": speaker, "role": role, "content": content})
         s.commit()
 
 
@@ -1628,23 +1614,15 @@ def _message_to_markdown(content: str) -> str:
     return safe_text.replace("\n", "  \n")
 
 
-def render_message(role: str, character: str, content: str, message_type: str = "text", image_url: str = None, reply_to_content: str = None):
+def render_message(role: str, character: str, content: str):
     is_user = (role == "user")
     avatar = avatar_for("user" if is_user else "assistant", character)
     safe_md = _message_to_markdown(content)
 
-    # 如果有引用消息，显示引用
-    if reply_to_content:
-        reply_author = "你" if is_user else character
-        st.markdown(f'<div class="wx-quote"><span class="wx-quote-author">{reply_author}:</span>{reply_to_content[:50]}...</div>', unsafe_allow_html=True)
-
     if is_user:
         st.markdown('<div class="wx-row user">', unsafe_allow_html=True)
         st.markdown('<div class="wx-bubble user">', unsafe_allow_html=True)
-        if message_type == "image" and image_url:
-            st.markdown(f'<img src="{image_url}" class="wx-image" />', unsafe_allow_html=True)
-        else:
-            st.markdown(safe_md)
+        st.markdown(safe_md)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1652,34 +1630,23 @@ def render_message(role: str, character: str, content: str, message_type: str = 
         st.markdown('<div class="wx-row bot">', unsafe_allow_html=True)
         st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
         st.markdown('<div class="wx-bubble bot">', unsafe_allow_html=True)
-        if message_type == "image" and image_url:
-            st.markdown(f'<img src="{image_url}" class="wx-image" />', unsafe_allow_html=True)
-        else:
-            st.markdown(safe_md)
+        st.markdown(safe_md)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_group_message(role: str, speaker: str, content: str, message_type: str = "text", image_url: str = None, reply_to_content: str = None):
+def render_group_message(role: str, speaker: str, content: str):
     is_user = (role == "user")
     avatar = avatar_for("user" if is_user else "assistant", speaker)
     safe_md = _message_to_markdown(content)
     safe_name = "你" if is_user else _html.escape(speaker)
-
-    # 如果有引用消息，显示引用
-    if reply_to_content:
-        reply_author = "你" if is_user else speaker
-        st.markdown(f'<div class="wx-quote"><span class="wx-quote-author">{reply_author}:</span>{reply_to_content[:50]}...</div>', unsafe_allow_html=True)
 
     if is_user:
         st.markdown('<div class="wx-row user">', unsafe_allow_html=True)
         st.markdown('<div>', unsafe_allow_html=True)
         st.markdown(f'<div class="wx-name user">{safe_name}</div>', unsafe_allow_html=True)
         st.markdown('<div class="wx-bubble user">', unsafe_allow_html=True)
-        if message_type == "image" and image_url:
-            st.markdown(f'<img src="{image_url}" class="wx-image" />', unsafe_allow_html=True)
-        else:
-            st.markdown(safe_md)
+        st.markdown(safe_md)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
@@ -1690,10 +1657,7 @@ def render_group_message(role: str, speaker: str, content: str, message_type: st
         st.markdown('<div>', unsafe_allow_html=True)
         st.markdown(f'<div class="wx-name">{safe_name}</div>', unsafe_allow_html=True)
         st.markdown('<div class="wx-bubble bot">', unsafe_allow_html=True)
-        if message_type == "image" and image_url:
-            st.markdown(f'<img src="{image_url}" class="wx-image" />', unsafe_allow_html=True)
-        else:
-            st.markdown(safe_md)
+        st.markdown(safe_md)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1738,20 +1702,6 @@ def render_group_typing(speaker: str):
 def render_history_manager(current_character: str):
     st.sidebar.divider()
     with st.sidebar.expander("聊天记录管理", expanded=False):
-        # 搜索功能
-        search_keyword = st.sidebar.text_input("🔍 搜索聊天记录", placeholder="输入关键词搜索", key=f"search_{current_character}")
-        if search_keyword:
-            search_results = search_messages(search_keyword, user_id, current_character if current_character != GROUP_CHAT else None)
-            if search_results:
-                st.sidebar.caption(f"找到 {len(search_results)} 条结果")
-                for msg in search_results[:10]:
-                    char = msg.get('character', msg.get('speaker', ''))
-                    role = "我" if msg.get('role') == 'user' else char
-                    st.sidebar.markdown(f"**{role}** ({msg['created_at'][:16]}): {msg['content'][:50]}...")
-            else:
-                st.sidebar.caption("未找到匹配的消息")
-        
-        # 显示/管理历史记录
         if current_character == GROUP_CHAT:
             history_rows = load_group_messages()
         else:
@@ -1781,55 +1731,10 @@ def render_history_manager(current_character: str):
                 st.rerun()
             else:
                 st.sidebar.info("未选择要删除的消息。")
-        
-        # 撤回功能 - 只显示用户自己发送的消息
-        user_msgs = df[df["role"] == "user"] if "role" in df.columns else pd.DataFrame()
-        if not user_msgs.empty:
-            st.sidebar.markdown("---")
-            st.sidebar.caption("💬 撤回消息")
-            msg_choices = {f"{row.get('content', '')[:30]}... ({row.get('created_at', '')[:16]})": row.get('id') 
-                          for _, row in user_msgs.iterrows()}
-            if msg_choices:
-                selected_msg = st.sidebar.selectbox("选择要撤回的消息", list(msg_choices.keys()), key=f"withdraw_select_{current_character}")
-                if st.sidebar.button("撤回这条消息", key=f"withdraw_btn_{current_character}"):
-                    msg_id = msg_choices[selected_msg]
-                    table = "group_messages_v2" if current_character == GROUP_CHAT else "chat_messages_v2"
-                    withdraw_message(msg_id, table)
-                    st.sidebar.success("消息已撤回。")
-                    st.rerun()
-        
-        # 导出聊天记录
-        st.sidebar.markdown("---")
-        st.sidebar.caption("📥 导出聊天记录")
-        export_format = st.sidebar.radio("格式", ["JSON", "TXT"], horizontal=True, key=f"export_format_{current_character}")
-        if st.sidebar.button("导出当前角色聊天记录", key=f"export_{current_character}"):
-            export_data = history_rows
-            if export_format == "JSON":
-                import json
-                export_str = json.dumps(export_data, ensure_ascii=False, indent=2)
-                st.sidebar.download_button(
-                    label="⬇️ 下载 JSON",
-                    data=export_str,
-                    file_name=f"chat_{current_character}_{datetime.now().strftime('%Y%m%d')}.json",
-                    mime="application/json"
-                )
-            else:
-                export_str = ""
-                for msg in export_data:
-                    role = msg.get("role", msg.get("speaker", ""))
-                    content = msg.get("content", "")
-                    time = str(msg.get("created_at", ""))[:19]
-                    export_str += f"[{time}] {role}: {content}\n\n"
-                st.sidebar.download_button(
-                    label="⬇️ 下载 TXT",
-                    data=export_str,
-                    file_name=f"chat_{current_character}_{datetime.now().strftime('%Y%m%d')}.txt",
-                    mime="text/plain"
-                )
 
 
 # =========================
-# AI：聊天/教学（支持 MiniMax / OpenAI）
+# OpenAI：聊天/教学
 # =========================
 def build_system_prompt(character: str, mode: str, sexy_mode: bool = False, user_prompt: str = "") -> str:
     base_persona = f"你在扮演{character}，性格是：{CHARACTERS[character]}。"
@@ -1868,30 +1773,15 @@ def build_system_prompt(character: str, mode: str, sexy_mode: bool = False, user
         "主动聊天：避免尴尬或生硬开场，尽量基于最近话题或用户兴趣发起轻量问题。\n"
         "输出格式：只输出一个 JSON 数组，例如 [\"消息1\",\"消息2\"]。\n"
         "规则：数组1-5条（条数随机）；每条1-3句话（随机）；每条尽量短（像微信）；不要输出除 JSON 外任何文字。"
-    
-    # 天气查询功能
-    weather_hint = """
-外部工具：
-- 用户询问天气时，你可以回复："我现在无法查询天气，但可以告诉你上海今天天气晴朗，气温20-28°C。"（或其他城市的通用天气回复）
-"""
+    )
     extra = SETTINGS.get("PROMPT_CHAT_EXTRA", "")
-    return base_persona + context_hint + "\n" + chat_core + sexy_core + weather_hint + ("\n" + extra if extra else "")
+    return base_persona + context_hint + "\n" + chat_core + sexy_core + ("\n" + extra if extra else "")
 
 
 def call_openai(messages, temperature: float):
-    # 优先使用 MiniMax，否则回退到 OpenAI
-    if "MINIMAX_API_KEY" in st.secrets:
-        client = OpenAI(
-            api_key=st.secrets["MINIMAX_API_KEY"],
-            base_url="https://api.minimax.chat/v1",
-        )
-        model = st.secrets.get("MINIMAX_MODEL", "MiniMax-M2.5")
-    else:
-        client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-        model = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
-    
+    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
     resp = client.chat.completions.create(
-        model=model,
+        model=st.secrets.get("OPENAI_MODEL", "gpt-4o-mini"),
         messages=messages,
         temperature=temperature,
         top_p=s_float("TOP_P", 1.0),
@@ -2355,42 +2245,15 @@ if st.sidebar.button(" ", key="sel_group", help=f"打开 {GROUP_DISPLAY_NAME}", 
     st.rerun()
 st.sidebar.markdown(render_group_item(is_group_active), unsafe_allow_html=True)
 
-# 多选模式
-if "multi_characters" not in st.session_state:
-    st.session_state.multi_characters = []
-
-# 多选切换按钮
-if st.sidebar.toggle("👥 多选聊天", value=bool(st.session_state.multi_characters), key="multi_chat_toggle"):
-    if not st.session_state.multi_characters:
-        st.session_state.multi_characters = list(CHARACTERS.keys())[:1]  # 默认选一个
-else:
-    st.session_state.multi_characters = []
-
-if st.session_state.multi_characters:
-    # 多选模式
-    st.sidebar.caption("选择要同时聊天的角色:")
-    for ch in CHARACTERS.keys():
-        is_selected = ch in st.session_state.multi_characters
-        if st.sidebar.checkbox(f"{DEFAULT_AVATARS.get(ch, '👤')} {ch}", value=is_selected, key=f"multi_{ch}"):
-            if ch not in st.session_state.multi_characters:
-                st.session_state.multi_characters.append(ch)
-        else:
-            if ch in st.session_state.multi_characters:
-                st.session_state.multi_characters.remove(ch)
-    
-    if st.sidebar.button("💬 开始多聊", key="start_multi_chat"):
-        # 进入多聊模式，显示所有选中角色的消息
-        pass
-else:
-    for ch in CHARACTERS.keys():
-        is_active = (st.session_state.selected_character == ch)
-        if st.sidebar.button(" ", key=f"sel_{ch}", help=f"打开 {ch}", use_container_width=True):
-            st.session_state.selected_character = ch
-            if st.session_state.mode == GROUP_CHAT:
-                st.session_state.mode = "聊天"
-            mark_seen(ch)
-            st.rerun()
-        st.sidebar.markdown(render_friend_item(ch, is_active), unsafe_allow_html=True)
+for ch in CHARACTERS.keys():
+    is_active = (st.session_state.selected_character == ch)
+    if st.sidebar.button(" ", key=f"sel_{ch}", help=f"打开 {ch}", use_container_width=True):
+        st.session_state.selected_character = ch
+        if st.session_state.mode == GROUP_CHAT:
+            st.session_state.mode = "聊天"
+        mark_seen(ch)
+        st.rerun()
+    st.sidebar.markdown(render_friend_item(ch, is_active), unsafe_allow_html=True)
 
 
 # =========================
@@ -2437,48 +2300,6 @@ render_history_manager(character)
 
 if character != GROUP_CHAT and affinity_score is not None:
     render_affinity_bar(character, affinity_score)
-
-# =========================
-# 新功能：角色资料、语音、背景、提醒
-# =========================
-with st.sidebar.expander("⚙️ 更多设置", expanded=False):
-    # 角色资料
-    if character != GROUP_CHAT:
-        if st.button(f"📇 查看{character}资料", key=f"profile_{character}"):
-            render_character_profile(character)
-    
-    # 语音朗读
-    tts_enabled = st.toggle("🎤 AI语音朗读回复", value=bool(s_int("TTS_ENABLED", 0)), key="tts_toggle")
-    if tts_enabled:
-        st.caption("开启后AI回复会朗读出来（需要浏览器支持）")
-    
-    # 自定义背景
-    bg_url = st.text_input("🖼️ 聊天背景图URL", value=SETTINGS.get("CHAT_BG", ""), placeholder="输入图片链接")
-    if bg_url:
-        st.markdown(f'''
-        <style>
-        .main.has-bg {{
-            background-image: url("{bg_url}");
-        }}
-        </style>
-        ''', unsafe_allow_html=True)
-    
-    # 提醒功能
-    st.markdown("---")
-    st.caption("⏰ 定时提醒")
-    reminder_enabled = st.toggle("开启提醒", value=bool(s_int("REMINDER_ENABLED", 0)), key="reminder_toggle")
-    if reminder_enabled:
-        reminder_time = st.time_input("提醒时间", value=datetime.strptime(s_int("REMINDER_TIME", 9), "%H").time() if s_int("REMINDER_TIME", 9) else datetime.now().time(), key="reminder_time")
-        reminder_msg = st.text_input("提醒内容", placeholder="要AI提醒你什么？", key="reminder_msg")
-        if st.button("设置提醒", key="set_reminder"):
-            add_reminder(user_id, reminder_time.strftime("%H:%M"), reminder_msg)
-            st.success(f"提醒已设置！每天 {reminder_time.strftime('%H:%M')} 提醒你")
-    
-    # 检查提醒
-    if reminder_enabled:
-        reminder = check_reminders(user_id)
-        if reminder:
-            st.warning(f"⏰ 提醒: {reminder}")
 
 
 def maybe_trigger_random_chat():
@@ -2717,63 +2538,6 @@ if character != GROUP_CHAT and st.session_state.mode == "教学":
 # =========================
 # 输入：用户发消息
 # =========================
-
-# 快捷表情面板
-QUICK_EMOJIS = ["😀", "😂", "😊", "😍", "🤔", "😅", "🙄", "😢", "😭", "😡", "👍", "👎", "❤️", "🎉", "🔥", "💪"]
-
-st.markdown("#### 💡快捷表情", unsafe_allow_html=True)
-cols = st.columns(len(QUICK_EMOJIS))
-for i, emoji in enumerate(QUICK_EMOJIS):
-    if cols[i % len(cols)].button(emoji, key=f"emoji_{i}", use_container_width=True):
-        # 直接发送表情
-        if character == GROUP_CHAT:
-            save_group_message("user", "user", emoji)
-            st.rerun()
-        else:
-            save_message(character, "user", emoji)
-            # AI可能会回复
-            st.rerun()
-
-# 深色模式切换
-dark_mode = s_int("DARK_MODE", 0)
-if st.sidebar.toggle("🌙 深色模式", value=bool(dark_mode), key="dark_mode_toggle"):
-    if "dark_mode" not in st.session_state:
-        st.session_state.dark_mode = True
-    st.session_state.dark_mode = True
-    st.markdown('<script>document.body.classList.add("dark");</script>', unsafe_allow_html=True)
-else:
-    st.session_state.dark_mode = False
-
-# 应用深色模式CSS
-if st.session_state.get("dark_mode", False):
-    st.markdown('<script>document.body.classList.add("dark");</script>', unsafe_allow_html=True)
-
-# 图片上传功能
-uploaded_file = st.file_uploader("📷 发送图片", type=["jpg", "jpeg", "png", "gif", "webp"], label_visibility="collapsed", key=f"img_upload_{current_character}")
-if uploaded_file:
-    # 将图片转为 base64 或保存到可访问的URL
-    import base64
-    from PIL import Image
-    import io
-    
-    img = Image.open(uploaded_file)
-    # 限制图片大小
-    img.thumbnail((800, 800))
-    
-    # 保存到 session_state 作为 base64
-    buf = io.BytesIO()
-    img.save(buf, format=img.format or "PNG")
-    img_b64 = base64.b64encode(buf.getvalue()).decode()
-    img_url = f"data:image/{img.format or 'png'};base64,{img_b64}"
-    
-    # 保存图片消息
-    if character == GROUP_CHAT:
-        save_group_message("user", "user", f"[图片]", message_type="image", image_url=img_url)
-    else:
-        save_message(character, "user", f"[图片]", message_type="image", image_url=img_url)
-    st.success("图片已发送！")
-    st.rerun()
-
 user_text = st.chat_input("输入消息…")
 if user_text:
     if character == GROUP_CHAT:
@@ -2826,257 +2590,3 @@ if user_text:
             st.rerun()
         start_pending_reply(character, st.session_state.mode, attachments=attachments)
         st.rerun()
-
-
-# =========================
-# 微信特色功能：撤回、引用、搜索
-# =========================
-
-def withdraw_message(msg_id: int, table: str = "chat_messages_v2"):
-    """撤回消息（标记为已删除）"""
-    with get_conn().session as s:
-        s.execute(text(f"UPDATE {table} SET is_deleted = 1 WHERE id = :id"), {"id": msg_id})
-        s.commit()
-
-
-def search_messages(keyword: str, user_id: int, character: str = None, limit: int = 20):
-    """搜索消息"""
-    params = {"keyword": f"%{keyword}%", "user_id": user_id}
-    char_cond = "AND character = :character" if character else ""
-    
-    sql = text(f"""
-        SELECT id, character, role, content, created_at 
-        FROM chat_messages_v2 
-        WHERE user_id = :user_id AND content LIKE :keyword AND is_deleted = 0 {char_cond}
-        ORDER BY created_at DESC LIMIT :limit
-    """)
-    params["limit"] = limit
-    if character:
-        params["character"] = character
-    
-    try:
-        df = get_conn().query(sql, params=params)
-        return df.to_dict('records') if not df.empty else []
-    except:
-        return []
-
-
-def get_message_by_id(msg_id: int, table: str = "chat_messages_v2"):
-    """根据ID获取消息"""
-    try:
-        df = get_conn().query(
-            text(f"SELECT * FROM {table} WHERE id = :id"),
-            {"id": msg_id}
-        )
-        return df.to_dict('records')[0] if not df.empty else None
-    except:
-        return None
-
-
-/* 引用消息样式 */
-.wx-quote {
-    background: rgba(0,0,0,0.03);
-    border-left: 3px solid rgba(0,0,0,0.2);
-    padding: 4px 8px;
-    margin-bottom: 6px;
-    border-radius: 4px;
-    font-size: 13px;
-    color: rgba(0,0,0,0.6);
-}
-.wx-quote-author {
-    font-weight: 600;
-    margin-right: 4px;
-}
-
-/* 消息操作按钮 */
-.wx-msg-actions {
-    display: none;
-    position: absolute;
-    right: -30px;
-    top: 50%;
-    transform: translateY(-50%);
-}
-.wx-row:hover .wx-msg-actions {
-    display: flex;
-    gap: 4px;
-}
-.wx-action-btn {
-    background: rgba(0,0,0,0.1);
-    border: none;
-    border-radius: 4px;
-    padding: 2px 6px;
-    font-size: 12px;
-    cursor: pointer;
-}
-.wx-action-btn:hover {
-    background: rgba(0,0,0,0.2);
-}
-
-
-/* =========================
-   深色模式样式
-   ========================= */
-.main.dark { background:#1e1e1e; }
-.main.dark .wx-chat { background:transparent; }
-.main.dark .wx-bubble.bot { background:#2d2d2d; border-color:#3d3d3d; color:#e0e0e0; }
-.main.dark .wx-bubble.user { background:#4caf50; border-color:#388e3c; }
-.main.dark .wx-time span { background:rgba(255,255,255,0.1); color:rgba(255,255,255,0.6); }
-.main.dark .wx-name { color:rgba(255,255,255,0.5); }
-.main.dark section[data-testid="stSidebar"] { background:#252525; }
-.main.dark .wx-item { background:rgba(255,255,255,0.05); border-color:rgba(255,255,255,0.1); }
-.main.dark .wx-item.active { background:rgba(255,255,255,0.1); }
-.main.dark .wx-item:hover { border-color:rgba(255,255,255,0.2); }
-.main.dark .wx-item .preview { color:rgba(255,255,255,0.5); }
-.main.dark .wx-title { color:#e0e0e0; }
-.main.dark .wx-pill { background:rgba(255,255,255,0.1); border-color:rgba(255,255,255,0.1); }
-.main.dark .affinity-bar { background:rgba(255,122,187,0.15); border-color:rgba(255,122,187,0.3); }
-.main.dark .affinity-label { color:rgba(255,255,255,0.7); }
-.main.dark .affinity-scale { color:rgba(255,255,255,0.4); }
-.main.dark div[data-testid="stChatInput"] { background:#1e1e1e; }
-
-/* 快捷表情 */
-.emoji-panel {
-    display:flex; gap:8px; flex-wrap:wrap; padding:8px 12px;
-    background:rgba(255,255,255,0.9);
-    border-radius:8px; margin-bottom:8px;
-}
-.main.dark .emoji-panel { background:rgba(50,50,50,0.9); }
-.emoji-btn {
-    font-size:20px; cursor:pointer; padding:4px; border-radius:4px;
-    transition:background 0.2s;
-}
-.emoji-btn:hover { background:rgba(0,0,0,0.1); }
-
-/* 图片消息 */
-.wx-image {
-    max-width:200px; border-radius:8px; cursor:pointer;
-    transition:transform 0.2s;
-}
-.wx-image:hover { transform:scale(1.02); }
-
-/* 引用消息深色模式 */
-.main.dark .wx-quote { background:rgba(255,255,255,0.05); border-color:rgba(255,255,255,0.2); color:rgba(255,255,255,0.6); }
-
-
-
-/* 自定义背景图 */
-.main.has-bg {
-    background-size: cover;
-    background-position: center;
-    background-repeat: no-repeat;
-}
-.main.has-bg > div:first-child {
-    background: rgba(255,255,255,0.85);
-}
-.main.dark.has-bg > div:first-child {
-    background: rgba(30,30,30,0.85);
-}
-
-/* 角色资料卡 */
-.profile-card {
-    background: white;
-    border-radius: 16px;
-    padding: 20px;
-    margin: 10px 0;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-}
-.dark .profile-card {
-    background: #2d2d2d;
-}
-.profile-avatar {
-    width: 80px;
-    height: 80px;
-    border-radius: 50%;
-    font-size: 40px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: rgba(0,0,0,0.1);
-    margin: 0 auto 10px;
-}
-.profile-name {
-    font-size: 24px;
-    font-weight: bold;
-    text-align: center;
-}
-.profile-desc {
-    font-size: 14px;
-    color: rgba(0,0,0,0.6);
-    text-align: center;
-    margin-top: 8px;
-}
-.dark .profile-desc {
-    color: rgba(255,255,255,0.6);
-}
-
-/* 语音播放按钮 */
-.tts-btn {
-    font-size: 12px;
-    margin-left: 8px;
-    cursor: pointer;
-    opacity: 0.6;
-}
-.tts-btn:hover {
-    opacity: 1;
-}
-
-
-/* 导出按钮 */
-.export-btns { display:flex; gap:8px; margin-top:8px; }
-
-
-# =========================
-# 语音、背景、提醒功能
-# =========================
-
-def get_weather_info(location: str = "上海") -> str:
-    """获取天气信息（简单实现，实际可用API）"""
-    # 这里可以接入天气API，目前返回模拟数据
-    return f"查询天气需要接入天气API，当前无法获取 {location} 的天气信息。"
-
-
-def speak_text(text: str):
-    """语音播放文字（需要前端JS支持）"""
-    # Streamlit不支持直接TTS，需要用audio组件或前端
-    pass
-
-
-def add_reminder(user_id: int, remind_time: str, message: str):
-    """添加提醒"""
-    # 可以存到数据库或session_state
-    if "reminders" not in st.session_state:
-        st.session_state.reminders = []
-    st.session_state.reminders.append({
-        "time": remind_time,
-        "message": message,
-        "user_id": user_id
-    })
-
-
-def check_reminders(user_id: int):
-    """检查并触发提醒"""
-    if "reminders" not in st.session_state:
-        return
-    
-    now = datetime.now()
-    current_time = now.strftime("%H:%M")
-    
-    for reminder in st.session_state.reminders:
-        if reminder.get("user_id") == user_id and reminder.get("time") == current_time:
-            return reminder.get("message")
-    return None
-
-
-def render_character_profile(character: str):
-    """渲染角色资料卡"""
-    avatar = DEFAULT_AVATARS.get(character, "👤")
-    desc = CHARACTERS.get(character, "这是一个角色")
-    
-    html = f'''
-    <div class="profile-card">
-        <div class="profile-avatar">{avatar}</div>
-        <div class="profile-name">{character}</div>
-        <div class="profile-desc">{desc}</div>
-    </div>
-    '''
-    st.markdown(html, unsafe_allow_html=True)
