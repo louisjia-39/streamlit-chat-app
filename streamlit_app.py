@@ -393,6 +393,8 @@ def ensure_tables_safe():
                 character TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                reply_to_id INTEGER,
+                is_deleted BOOLEAN NOT NULL DEFAULT 0,
                 created_at {ts_type} NOT NULL DEFAULT {ts_default}
             );
         """))
@@ -408,6 +410,8 @@ def ensure_tables_safe():
                 speaker TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                reply_to_id INTEGER,
+                is_deleted BOOLEAN NOT NULL DEFAULT 0,
                 created_at {ts_type} NOT NULL DEFAULT {ts_default}
             );
         """))
@@ -1328,9 +1332,9 @@ def avatar_for(role: str, character: str):
 def load_messages(character: str, user_id: int | None = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = """
-        SELECT id, role, content, created_at
+        SELECT id, role, content, created_at, reply_to_id
         FROM chat_messages_v2
-        WHERE user_id = :uid AND character = :ch
+        WHERE user_id = :uid AND character = :ch AND is_deleted = 0
         ORDER BY created_at
     """
     df = get_conn().query(q, params={"uid": uid, "ch": character}, ttl=0)
@@ -1438,9 +1442,9 @@ def get_last_user_message_ts(history: list[dict]) -> float | None:
 def load_group_messages(user_id: int | None = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = """
-        SELECT id, speaker, role, content, created_at
+        SELECT id, speaker, role, content, created_at, reply_to_id
         FROM group_messages_v2
-        WHERE user_id = :uid
+        WHERE user_id = :uid AND is_deleted = 0
         ORDER BY created_at
     """
     df = get_conn().query(q, params={"uid": uid}, ttl=0)
@@ -1701,6 +1705,20 @@ def render_group_typing(speaker: str):
 def render_history_manager(current_character: str):
     st.sidebar.divider()
     with st.sidebar.expander("聊天记录管理", expanded=False):
+        # 搜索功能
+        search_keyword = st.sidebar.text_input("🔍 搜索聊天记录", placeholder="输入关键词搜索", key=f"search_{current_character}")
+        if search_keyword:
+            search_results = search_messages(search_keyword, user_id, current_character if current_character != GROUP_CHAT else None)
+            if search_results:
+                st.sidebar.caption(f"找到 {len(search_results)} 条结果")
+                for msg in search_results[:10]:
+                    char = msg.get('character', msg.get('speaker', ''))
+                    role = "我" if msg.get('role') == 'user' else char
+                    st.sidebar.markdown(f"**{role}** ({msg['created_at'][:16]}): {msg['content'][:50]}...")
+            else:
+                st.sidebar.caption("未找到匹配的消息")
+        
+        # 显示/管理历史记录
         if current_character == GROUP_CHAT:
             history_rows = load_group_messages()
         else:
@@ -2599,3 +2617,88 @@ if user_text:
             st.rerun()
         start_pending_reply(character, st.session_state.mode, attachments=attachments)
         st.rerun()
+
+
+# =========================
+# 微信特色功能：撤回、引用、搜索
+# =========================
+
+def withdraw_message(msg_id: int, table: str = "chat_messages_v2"):
+    """撤回消息（标记为已删除）"""
+    with get_conn().session as s:
+        s.execute(text(f"UPDATE {table} SET is_deleted = 1 WHERE id = :id"), {"id": msg_id})
+        s.commit()
+
+
+def search_messages(keyword: str, user_id: int, character: str = None, limit: int = 20):
+    """搜索消息"""
+    params = {"keyword": f"%{keyword}%", "user_id": user_id}
+    char_cond = "AND character = :character" if character else ""
+    
+    sql = text(f"""
+        SELECT id, character, role, content, created_at 
+        FROM chat_messages_v2 
+        WHERE user_id = :user_id AND content LIKE :keyword AND is_deleted = 0 {char_cond}
+        ORDER BY created_at DESC LIMIT :limit
+    """)
+    params["limit"] = limit
+    if character:
+        params["character"] = character
+    
+    try:
+        df = get_conn().query(sql, params=params)
+        return df.to_dict('records') if not df.empty else []
+    except:
+        return []
+
+
+def get_message_by_id(msg_id: int, table: str = "chat_messages_v2"):
+    """根据ID获取消息"""
+    try:
+        df = get_conn().query(
+            text(f"SELECT * FROM {table} WHERE id = :id"),
+            {"id": msg_id}
+        )
+        return df.to_dict('records')[0] if not df.empty else None
+    except:
+        return None
+
+
+/* 引用消息样式 */
+.wx-quote {
+    background: rgba(0,0,0,0.03);
+    border-left: 3px solid rgba(0,0,0,0.2);
+    padding: 4px 8px;
+    margin-bottom: 6px;
+    border-radius: 4px;
+    font-size: 13px;
+    color: rgba(0,0,0,0.6);
+}
+.wx-quote-author {
+    font-weight: 600;
+    margin-right: 4px;
+}
+
+/* 消息操作按钮 */
+.wx-msg-actions {
+    display: none;
+    position: absolute;
+    right: -30px;
+    top: 50%;
+    transform: translateY(-50%);
+}
+.wx-row:hover .wx-msg-actions {
+    display: flex;
+    gap: 4px;
+}
+.wx-action-btn {
+    background: rgba(0,0,0,0.1);
+    border: none;
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 12px;
+    cursor: pointer;
+}
+.wx-action-btn:hover {
+    background: rgba(0,0,0,0.2);
+}
