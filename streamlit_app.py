@@ -49,6 +49,7 @@ DEFAULT_SETTINGS = {
     "FREQUENCY_PENALTY": "0.25",
     "PROMPT_CHAT_EXTRA": "",
     "PROMPT_TEACH_EXTRA": "",
+    "DARK_MODE": "0",
     "PROACTIVE_ENABLED": "1",
     "PROACTIVE_MIN_INTERVAL_MIN": "20",
     "PROACTIVE_PROB_PCT": "25",
@@ -393,6 +394,8 @@ def ensure_tables_safe():
                 character TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                message_type TEXT NOT NULL DEFAULT 'text',
+                image_url TEXT,
                 reply_to_id INTEGER,
                 is_deleted BOOLEAN NOT NULL DEFAULT 0,
                 created_at {ts_type} NOT NULL DEFAULT {ts_default}
@@ -410,6 +413,8 @@ def ensure_tables_safe():
                 speaker TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                message_type TEXT NOT NULL DEFAULT 'text',
+                image_url TEXT,
                 reply_to_id INTEGER,
                 is_deleted BOOLEAN NOT NULL DEFAULT 0,
                 created_at {ts_type} NOT NULL DEFAULT {ts_default}
@@ -1332,7 +1337,7 @@ def avatar_for(role: str, character: str):
 def load_messages(character: str, user_id: int | None = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = """
-        SELECT id, role, content, created_at, reply_to_id
+        SELECT id, role, content, created_at, reply_to_id, message_type, image_url
         FROM chat_messages_v2
         WHERE user_id = :uid AND character = :ch AND is_deleted = 0
         ORDER BY created_at
@@ -1349,14 +1354,15 @@ def load_messages(character: str, user_id: int | None = None):
     return recs
 
 
-def save_message(character: str, role: str, content: str, user_id: int | None = None):
+def save_message(character: str, role: str, content: str, user_id: int | None = None, message_type: str = "text", image_url: str = None, reply_to_id: int = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = text("""
-        INSERT INTO chat_messages_v2 (user_id, character, role, content)
-        VALUES (:uid, :ch, :role, :content)
+        INSERT INTO chat_messages_v2 (user_id, character, role, content, message_type, image_url, reply_to_id)
+        VALUES (:uid, :ch, :role, :content, :msg_type, :img_url, :reply_to)
     """)
     with get_conn().session as s:
-        s.execute(q, {"uid": uid, "ch": character, "role": role, "content": content})
+        s.execute(q, {"uid": uid, "ch": character, "role": role, "content": content, 
+                      "msg_type": message_type, "img_url": image_url, "reply_to": reply_to_id})
         s.commit()
 
 
@@ -1442,7 +1448,7 @@ def get_last_user_message_ts(history: list[dict]) -> float | None:
 def load_group_messages(user_id: int | None = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = """
-        SELECT id, speaker, role, content, created_at, reply_to_id
+        SELECT id, speaker, role, content, created_at, reply_to_id, message_type, image_url
         FROM group_messages_v2
         WHERE user_id = :uid AND is_deleted = 0
         ORDER BY created_at
@@ -1459,14 +1465,15 @@ def load_group_messages(user_id: int | None = None):
     return recs
 
 
-def save_group_message(speaker: str, role: str, content: str, user_id: int | None = None):
+def save_group_message(speaker: str, role: str, content: str, user_id: int | None = None, message_type: str = "text", image_url: str = None, reply_to_id: int = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = text("""
-        INSERT INTO group_messages_v2 (user_id, speaker, role, content)
-        VALUES (:uid, :sp, :role, :content)
+        INSERT INTO group_messages_v2 (user_id, speaker, role, content, message_type, image_url, reply_to_id)
+        VALUES (:uid, :sp, :role, :content, :msg_type, :img_url, :reply_to)
     """)
     with get_conn().session as s:
-        s.execute(q, {"uid": uid, "sp": speaker, "role": role, "content": content})
+        s.execute(q, {"uid": uid, "sp": speaker, "role": role, "content": content,
+                      "msg_type": message_type, "img_url": image_url, "reply_to": reply_to_id})
         s.commit()
 
 
@@ -1617,15 +1624,23 @@ def _message_to_markdown(content: str) -> str:
     return safe_text.replace("\n", "  \n")
 
 
-def render_message(role: str, character: str, content: str):
+def render_message(role: str, character: str, content: str, message_type: str = "text", image_url: str = None, reply_to_content: str = None):
     is_user = (role == "user")
     avatar = avatar_for("user" if is_user else "assistant", character)
     safe_md = _message_to_markdown(content)
 
+    # 如果有引用消息，显示引用
+    if reply_to_content:
+        reply_author = "你" if is_user else character
+        st.markdown(f'<div class="wx-quote"><span class="wx-quote-author">{reply_author}:</span>{reply_to_content[:50]}...</div>', unsafe_allow_html=True)
+
     if is_user:
         st.markdown('<div class="wx-row user">', unsafe_allow_html=True)
         st.markdown('<div class="wx-bubble user">', unsafe_allow_html=True)
-        st.markdown(safe_md)
+        if message_type == "image" and image_url:
+            st.markdown(f'<img src="{image_url}" class="wx-image" />', unsafe_allow_html=True)
+        else:
+            st.markdown(safe_md)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1633,23 +1648,34 @@ def render_message(role: str, character: str, content: str):
         st.markdown('<div class="wx-row bot">', unsafe_allow_html=True)
         st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
         st.markdown('<div class="wx-bubble bot">', unsafe_allow_html=True)
-        st.markdown(safe_md)
+        if message_type == "image" and image_url:
+            st.markdown(f'<img src="{image_url}" class="wx-image" />', unsafe_allow_html=True)
+        else:
+            st.markdown(safe_md)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_group_message(role: str, speaker: str, content: str):
+def render_group_message(role: str, speaker: str, content: str, message_type: str = "text", image_url: str = None, reply_to_content: str = None):
     is_user = (role == "user")
     avatar = avatar_for("user" if is_user else "assistant", speaker)
     safe_md = _message_to_markdown(content)
     safe_name = "你" if is_user else _html.escape(speaker)
+
+    # 如果有引用消息，显示引用
+    if reply_to_content:
+        reply_author = "你" if is_user else speaker
+        st.markdown(f'<div class="wx-quote"><span class="wx-quote-author">{reply_author}:</span>{reply_to_content[:50]}...</div>', unsafe_allow_html=True)
 
     if is_user:
         st.markdown('<div class="wx-row user">', unsafe_allow_html=True)
         st.markdown('<div>', unsafe_allow_html=True)
         st.markdown(f'<div class="wx-name user">{safe_name}</div>', unsafe_allow_html=True)
         st.markdown('<div class="wx-bubble user">', unsafe_allow_html=True)
-        st.markdown(safe_md)
+        if message_type == "image" and image_url:
+            st.markdown(f'<img src="{image_url}" class="wx-image" />', unsafe_allow_html=True)
+        else:
+            st.markdown(safe_md)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
@@ -1660,7 +1686,10 @@ def render_group_message(role: str, speaker: str, content: str):
         st.markdown('<div>', unsafe_allow_html=True)
         st.markdown(f'<div class="wx-name">{safe_name}</div>', unsafe_allow_html=True)
         st.markdown('<div class="wx-bubble bot">', unsafe_allow_html=True)
-        st.markdown(safe_md)
+        if message_type == "image" and image_url:
+            st.markdown(f'<img src="{image_url}" class="wx-image" />', unsafe_allow_html=True)
+        else:
+            st.markdown(safe_md)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1764,6 +1793,35 @@ def render_history_manager(current_character: str):
                     withdraw_message(msg_id, table)
                     st.sidebar.success("消息已撤回。")
                     st.rerun()
+        
+        # 导出聊天记录
+        st.sidebar.markdown("---")
+        st.sidebar.caption("📥 导出聊天记录")
+        export_format = st.sidebar.radio("格式", ["JSON", "TXT"], horizontal=True, key=f"export_format_{current_character}")
+        if st.sidebar.button("导出当前角色聊天记录", key=f"export_{current_character}"):
+            export_data = history_rows
+            if export_format == "JSON":
+                import json
+                export_str = json.dumps(export_data, ensure_ascii=False, indent=2)
+                st.sidebar.download_button(
+                    label="⬇️ 下载 JSON",
+                    data=export_str,
+                    file_name=f"chat_{current_character}_{datetime.now().strftime('%Y%m%d')}.json",
+                    mime="application/json"
+                )
+            else:
+                export_str = ""
+                for msg in export_data:
+                    role = msg.get("role", msg.get("speaker", ""))
+                    content = msg.get("content", "")
+                    time = str(msg.get("created_at", ""))[:19]
+                    export_str += f"[{time}] {role}: {content}\n\n"
+                st.sidebar.download_button(
+                    label="⬇️ 下载 TXT",
+                    data=export_str,
+                    file_name=f"chat_{current_character}_{datetime.now().strftime('%Y%m%d')}.txt",
+                    mime="text/plain"
+                )
 
 
 # =========================
@@ -2581,6 +2639,63 @@ if character != GROUP_CHAT and st.session_state.mode == "教学":
 # =========================
 # 输入：用户发消息
 # =========================
+
+# 快捷表情面板
+QUICK_EMOJIS = ["😀", "😂", "😊", "😍", "🤔", "😅", "🙄", "😢", "😭", "😡", "👍", "👎", "❤️", "🎉", "🔥", "💪"]
+
+st.markdown("#### 💡快捷表情", unsafe_allow_html=True)
+cols = st.columns(len(QUICK_EMOJIS))
+for i, emoji in enumerate(QUICK_EMOJIS):
+    if cols[i % len(cols)].button(emoji, key=f"emoji_{i}", use_container_width=True):
+        # 直接发送表情
+        if character == GROUP_CHAT:
+            save_group_message("user", "user", emoji)
+            st.rerun()
+        else:
+            save_message(character, "user", emoji)
+            # AI可能会回复
+            st.rerun()
+
+# 深色模式切换
+dark_mode = s_int("DARK_MODE", 0)
+if st.sidebar.toggle("🌙 深色模式", value=bool(dark_mode), key="dark_mode_toggle"):
+    if "dark_mode" not in st.session_state:
+        st.session_state.dark_mode = True
+    st.session_state.dark_mode = True
+    st.markdown('<script>document.body.classList.add("dark");</script>', unsafe_allow_html=True)
+else:
+    st.session_state.dark_mode = False
+
+# 应用深色模式CSS
+if st.session_state.get("dark_mode", False):
+    st.markdown('<script>document.body.classList.add("dark");</script>', unsafe_allow_html=True)
+
+# 图片上传功能
+uploaded_file = st.file_uploader("📷 发送图片", type=["jpg", "jpeg", "png", "gif", "webp"], label_visibility="collapsed", key=f"img_upload_{current_character}")
+if uploaded_file:
+    # 将图片转为 base64 或保存到可访问的URL
+    import base64
+    from PIL import Image
+    import io
+    
+    img = Image.open(uploaded_file)
+    # 限制图片大小
+    img.thumbnail((800, 800))
+    
+    # 保存到 session_state 作为 base64
+    buf = io.BytesIO()
+    img.save(buf, format=img.format or "PNG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode()
+    img_url = f"data:image/{img.format or 'png'};base64,{img_b64}"
+    
+    # 保存图片消息
+    if character == GROUP_CHAT:
+        save_group_message("user", "user", f"[图片]", message_type="image", image_url=img_url)
+    else:
+        save_message(character, "user", f"[图片]", message_type="image", image_url=img_url)
+    st.success("图片已发送！")
+    st.rerun()
+
 user_text = st.chat_input("输入消息…")
 if user_text:
     if character == GROUP_CHAT:
@@ -2718,3 +2833,51 @@ def get_message_by_id(msg_id: int, table: str = "chat_messages_v2"):
 .wx-action-btn:hover {
     background: rgba(0,0,0,0.2);
 }
+
+
+/* =========================
+   深色模式样式
+   ========================= */
+.main.dark { background:#1e1e1e; }
+.main.dark .wx-chat { background:transparent; }
+.main.dark .wx-bubble.bot { background:#2d2d2d; border-color:#3d3d3d; color:#e0e0e0; }
+.main.dark .wx-bubble.user { background:#4caf50; border-color:#388e3c; }
+.main.dark .wx-time span { background:rgba(255,255,255,0.1); color:rgba(255,255,255,0.6); }
+.main.dark .wx-name { color:rgba(255,255,255,0.5); }
+.main.dark section[data-testid="stSidebar"] { background:#252525; }
+.main.dark .wx-item { background:rgba(255,255,255,0.05); border-color:rgba(255,255,255,0.1); }
+.main.dark .wx-item.active { background:rgba(255,255,255,0.1); }
+.main.dark .wx-item:hover { border-color:rgba(255,255,255,0.2); }
+.main.dark .wx-item .preview { color:rgba(255,255,255,0.5); }
+.main.dark .wx-title { color:#e0e0e0; }
+.main.dark .wx-pill { background:rgba(255,255,255,0.1); border-color:rgba(255,255,255,0.1); }
+.main.dark .affinity-bar { background:rgba(255,122,187,0.15); border-color:rgba(255,122,187,0.3); }
+.main.dark .affinity-label { color:rgba(255,255,255,0.7); }
+.main.dark .affinity-scale { color:rgba(255,255,255,0.4); }
+.main.dark div[data-testid="stChatInput"] { background:#1e1e1e; }
+
+/* 快捷表情 */
+.emoji-panel {
+    display:flex; gap:8px; flex-wrap:wrap; padding:8px 12px;
+    background:rgba(255,255,255,0.9);
+    border-radius:8px; margin-bottom:8px;
+}
+.main.dark .emoji-panel { background:rgba(50,50,50,0.9); }
+.emoji-btn {
+    font-size:20px; cursor:pointer; padding:4px; border-radius:4px;
+    transition:background 0.2s;
+}
+.emoji-btn:hover { background:rgba(0,0,0,0.1); }
+
+/* 图片消息 */
+.wx-image {
+    max-width:200px; border-radius:8px; cursor:pointer;
+    transition:transform 0.2s;
+}
+.wx-image:hover { transform:scale(1.02); }
+
+/* 引用消息深色模式 */
+.main.dark .wx-quote { background:rgba(255,255,255,0.05); border-color:rgba(255,255,255,0.2); color:rgba(255,255,255,0.6); }
+
+/* 导出按钮 */
+.export-btns { display:flex; gap:8px; margin-top:8px; }
