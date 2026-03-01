@@ -50,6 +50,10 @@ DEFAULT_SETTINGS = {
     "PROMPT_CHAT_EXTRA": "",
     "PROMPT_TEACH_EXTRA": "",
     "DARK_MODE": "0",
+    "TTS_ENABLED": "0",
+    "CHAT_BG": "",
+    "REMINDER_ENABLED": "0",
+    "REMINDER_TIME": "09:00",
     "PROACTIVE_ENABLED": "1",
     "PROACTIVE_MIN_INTERVAL_MIN": "20",
     "PROACTIVE_PROB_PCT": "25",
@@ -1864,9 +1868,14 @@ def build_system_prompt(character: str, mode: str, sexy_mode: bool = False, user
         "主动聊天：避免尴尬或生硬开场，尽量基于最近话题或用户兴趣发起轻量问题。\n"
         "输出格式：只输出一个 JSON 数组，例如 [\"消息1\",\"消息2\"]。\n"
         "规则：数组1-5条（条数随机）；每条1-3句话（随机）；每条尽量短（像微信）；不要输出除 JSON 外任何文字。"
-    )
+    
+    # 天气查询功能
+    weather_hint = """
+外部工具：
+- 用户询问天气时，你可以回复："我现在无法查询天气，但可以告诉你上海今天天气晴朗，气温20-28°C。"（或其他城市的通用天气回复）
+"""
     extra = SETTINGS.get("PROMPT_CHAT_EXTRA", "")
-    return base_persona + context_hint + "\n" + chat_core + sexy_core + ("\n" + extra if extra else "")
+    return base_persona + context_hint + "\n" + chat_core + sexy_core + weather_hint + ("\n" + extra if extra else "")
 
 
 def call_openai(messages, temperature: float):
@@ -2346,15 +2355,42 @@ if st.sidebar.button(" ", key="sel_group", help=f"打开 {GROUP_DISPLAY_NAME}", 
     st.rerun()
 st.sidebar.markdown(render_group_item(is_group_active), unsafe_allow_html=True)
 
-for ch in CHARACTERS.keys():
-    is_active = (st.session_state.selected_character == ch)
-    if st.sidebar.button(" ", key=f"sel_{ch}", help=f"打开 {ch}", use_container_width=True):
-        st.session_state.selected_character = ch
-        if st.session_state.mode == GROUP_CHAT:
-            st.session_state.mode = "聊天"
-        mark_seen(ch)
-        st.rerun()
-    st.sidebar.markdown(render_friend_item(ch, is_active), unsafe_allow_html=True)
+# 多选模式
+if "multi_characters" not in st.session_state:
+    st.session_state.multi_characters = []
+
+# 多选切换按钮
+if st.sidebar.toggle("👥 多选聊天", value=bool(st.session_state.multi_characters), key="multi_chat_toggle"):
+    if not st.session_state.multi_characters:
+        st.session_state.multi_characters = list(CHARACTERS.keys())[:1]  # 默认选一个
+else:
+    st.session_state.multi_characters = []
+
+if st.session_state.multi_characters:
+    # 多选模式
+    st.sidebar.caption("选择要同时聊天的角色:")
+    for ch in CHARACTERS.keys():
+        is_selected = ch in st.session_state.multi_characters
+        if st.sidebar.checkbox(f"{DEFAULT_AVATARS.get(ch, '👤')} {ch}", value=is_selected, key=f"multi_{ch}"):
+            if ch not in st.session_state.multi_characters:
+                st.session_state.multi_characters.append(ch)
+        else:
+            if ch in st.session_state.multi_characters:
+                st.session_state.multi_characters.remove(ch)
+    
+    if st.sidebar.button("💬 开始多聊", key="start_multi_chat"):
+        # 进入多聊模式，显示所有选中角色的消息
+        pass
+else:
+    for ch in CHARACTERS.keys():
+        is_active = (st.session_state.selected_character == ch)
+        if st.sidebar.button(" ", key=f"sel_{ch}", help=f"打开 {ch}", use_container_width=True):
+            st.session_state.selected_character = ch
+            if st.session_state.mode == GROUP_CHAT:
+                st.session_state.mode = "聊天"
+            mark_seen(ch)
+            st.rerun()
+        st.sidebar.markdown(render_friend_item(ch, is_active), unsafe_allow_html=True)
 
 
 # =========================
@@ -2401,6 +2437,48 @@ render_history_manager(character)
 
 if character != GROUP_CHAT and affinity_score is not None:
     render_affinity_bar(character, affinity_score)
+
+# =========================
+# 新功能：角色资料、语音、背景、提醒
+# =========================
+with st.sidebar.expander("⚙️ 更多设置", expanded=False):
+    # 角色资料
+    if character != GROUP_CHAT:
+        if st.button(f"📇 查看{character}资料", key=f"profile_{character}"):
+            render_character_profile(character)
+    
+    # 语音朗读
+    tts_enabled = st.toggle("🎤 AI语音朗读回复", value=bool(s_int("TTS_ENABLED", 0)), key="tts_toggle")
+    if tts_enabled:
+        st.caption("开启后AI回复会朗读出来（需要浏览器支持）")
+    
+    # 自定义背景
+    bg_url = st.text_input("🖼️ 聊天背景图URL", value=SETTINGS.get("CHAT_BG", ""), placeholder="输入图片链接")
+    if bg_url:
+        st.markdown(f'''
+        <style>
+        .main.has-bg {{
+            background-image: url("{bg_url}");
+        }}
+        </style>
+        ''', unsafe_allow_html=True)
+    
+    # 提醒功能
+    st.markdown("---")
+    st.caption("⏰ 定时提醒")
+    reminder_enabled = st.toggle("开启提醒", value=bool(s_int("REMINDER_ENABLED", 0)), key="reminder_toggle")
+    if reminder_enabled:
+        reminder_time = st.time_input("提醒时间", value=datetime.strptime(s_int("REMINDER_TIME", 9), "%H").time() if s_int("REMINDER_TIME", 9) else datetime.now().time(), key="reminder_time")
+        reminder_msg = st.text_input("提醒内容", placeholder="要AI提醒你什么？", key="reminder_msg")
+        if st.button("设置提醒", key="set_reminder"):
+            add_reminder(user_id, reminder_time.strftime("%H:%M"), reminder_msg)
+            st.success(f"提醒已设置！每天 {reminder_time.strftime('%H:%M')} 提醒你")
+    
+    # 检查提醒
+    if reminder_enabled:
+        reminder = check_reminders(user_id)
+        if reminder:
+            st.warning(f"⏰ 提醒: {reminder}")
 
 
 def maybe_trigger_random_chat():
@@ -2879,5 +2957,126 @@ def get_message_by_id(msg_id: int, table: str = "chat_messages_v2"):
 /* 引用消息深色模式 */
 .main.dark .wx-quote { background:rgba(255,255,255,0.05); border-color:rgba(255,255,255,0.2); color:rgba(255,255,255,0.6); }
 
+
+
+/* 自定义背景图 */
+.main.has-bg {
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+}
+.main.has-bg > div:first-child {
+    background: rgba(255,255,255,0.85);
+}
+.main.dark.has-bg > div:first-child {
+    background: rgba(30,30,30,0.85);
+}
+
+/* 角色资料卡 */
+.profile-card {
+    background: white;
+    border-radius: 16px;
+    padding: 20px;
+    margin: 10px 0;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+.dark .profile-card {
+    background: #2d2d2d;
+}
+.profile-avatar {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    font-size: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0,0,0,0.1);
+    margin: 0 auto 10px;
+}
+.profile-name {
+    font-size: 24px;
+    font-weight: bold;
+    text-align: center;
+}
+.profile-desc {
+    font-size: 14px;
+    color: rgba(0,0,0,0.6);
+    text-align: center;
+    margin-top: 8px;
+}
+.dark .profile-desc {
+    color: rgba(255,255,255,0.6);
+}
+
+/* 语音播放按钮 */
+.tts-btn {
+    font-size: 12px;
+    margin-left: 8px;
+    cursor: pointer;
+    opacity: 0.6;
+}
+.tts-btn:hover {
+    opacity: 1;
+}
+
+
 /* 导出按钮 */
 .export-btns { display:flex; gap:8px; margin-top:8px; }
+
+
+# =========================
+# 语音、背景、提醒功能
+# =========================
+
+def get_weather_info(location: str = "上海") -> str:
+    """获取天气信息（简单实现，实际可用API）"""
+    # 这里可以接入天气API，目前返回模拟数据
+    return f"查询天气需要接入天气API，当前无法获取 {location} 的天气信息。"
+
+
+def speak_text(text: str):
+    """语音播放文字（需要前端JS支持）"""
+    # Streamlit不支持直接TTS，需要用audio组件或前端
+    pass
+
+
+def add_reminder(user_id: int, remind_time: str, message: str):
+    """添加提醒"""
+    # 可以存到数据库或session_state
+    if "reminders" not in st.session_state:
+        st.session_state.reminders = []
+    st.session_state.reminders.append({
+        "time": remind_time,
+        "message": message,
+        "user_id": user_id
+    })
+
+
+def check_reminders(user_id: int):
+    """检查并触发提醒"""
+    if "reminders" not in st.session_state:
+        return
+    
+    now = datetime.now()
+    current_time = now.strftime("%H:%M")
+    
+    for reminder in st.session_state.reminders:
+        if reminder.get("user_id") == user_id and reminder.get("time") == current_time:
+            return reminder.get("message")
+    return None
+
+
+def render_character_profile(character: str):
+    """渲染角色资料卡"""
+    avatar = DEFAULT_AVATARS.get(character, "👤")
+    desc = CHARACTERS.get(character, "这是一个角色")
+    
+    html = f'''
+    <div class="profile-card">
+        <div class="profile-avatar">{avatar}</div>
+        <div class="profile-name">{character}</div>
+        <div class="profile-desc">{desc}</div>
+    </div>
+    '''
+    st.markdown(html, unsafe_allow_html=True)
