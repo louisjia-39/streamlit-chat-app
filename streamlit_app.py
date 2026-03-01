@@ -1624,7 +1624,7 @@ def _message_to_markdown(content: str) -> str:
     return safe_text.replace("\n", "  \n")
 
 
-def render_message(role: str, character: str, content: str):
+def render_message(role: str, character: str, content: str, message_type: str = "text", image_url: str = None):
     is_user = (role == "user")
     avatar = avatar_for("user" if is_user else "assistant", character)
     safe_md = _message_to_markdown(content)
@@ -1632,7 +1632,10 @@ def render_message(role: str, character: str, content: str):
     if is_user:
         st.markdown('<div class="wx-row user">', unsafe_allow_html=True)
         st.markdown('<div class="wx-bubble user">', unsafe_allow_html=True)
-        st.markdown(safe_md)
+        if message_type == "image" and image_url:
+            st.markdown(f'<img src="{image_url}" style="max-width:200px;border-radius:8px;" />', unsafe_allow_html=True)
+        else:
+            st.markdown(safe_md)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1640,12 +1643,15 @@ def render_message(role: str, character: str, content: str):
         st.markdown('<div class="wx-row bot">', unsafe_allow_html=True)
         st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
         st.markdown('<div class="wx-bubble bot">', unsafe_allow_html=True)
-        st.markdown(safe_md)
+        if message_type == "image" and image_url:
+            st.markdown(f'<img src="{image_url}" style="max-width:200px;border-radius:8px;" />', unsafe_allow_html=True)
+        else:
+            st.markdown(safe_md)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_group_message(role: str, speaker: str, content: str):
+def render_group_message(role: str, speaker: str, content: str, message_type: str = "text", image_url: str = None):
     is_user = (role == "user")
     avatar = avatar_for("user" if is_user else "assistant", speaker)
     safe_md = _message_to_markdown(content)
@@ -1656,7 +1662,10 @@ def render_group_message(role: str, speaker: str, content: str):
         st.markdown('<div>', unsafe_allow_html=True)
         st.markdown(f'<div class="wx-name user">{safe_name}</div>', unsafe_allow_html=True)
         st.markdown('<div class="wx-bubble user">', unsafe_allow_html=True)
-        st.markdown(safe_md)
+        if message_type == "image" and image_url:
+            st.markdown(f'<img src="{image_url}" style="max-width:200px;border-radius:8px;" />', unsafe_allow_html=True)
+        else:
+            st.markdown(safe_md)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
@@ -1667,7 +1676,10 @@ def render_group_message(role: str, speaker: str, content: str):
         st.markdown('<div>', unsafe_allow_html=True)
         st.markdown(f'<div class="wx-name">{safe_name}</div>', unsafe_allow_html=True)
         st.markdown('<div class="wx-bubble bot">', unsafe_allow_html=True)
-        st.markdown(safe_md)
+        if message_type == "image" and image_url:
+            st.markdown(f'<img src="{image_url}" style="max-width:200px;border-radius:8px;" />', unsafe_allow_html=True)
+        else:
+            st.markdown(safe_md)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
@@ -2575,7 +2587,7 @@ for msg in history:
     if character == GROUP_CHAT:
         render_group_message(msg.get("role", "assistant"), msg.get("speaker", ""), msg.get("content", ""))
     else:
-        render_message(msg["role"], character, msg["content"])
+        render_message(msg["role"], character, msg.get("content", ""), msg.get("message_type", "text"), msg.get("image_url"))
 
 if character != GROUP_CHAT and has_pending_for(character):
     render_typing(character)
