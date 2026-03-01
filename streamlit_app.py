@@ -394,6 +394,10 @@ def ensure_tables_safe():
                 character TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                message_type TEXT NOT NULL DEFAULT 'text',
+                image_url TEXT,
+                reply_to_id INTEGER,
+                is_deleted BOOLEAN NOT NULL DEFAULT 0,
                 created_at {ts_type} NOT NULL DEFAULT {ts_default}
             );
         """))
@@ -409,6 +413,10 @@ def ensure_tables_safe():
                 speaker TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                message_type TEXT NOT NULL DEFAULT 'text',
+                image_url TEXT,
+                reply_to_id INTEGER,
+                is_deleted BOOLEAN NOT NULL DEFAULT 0,
                 created_at {ts_type} NOT NULL DEFAULT {ts_default}
             );
         """))
@@ -1329,9 +1337,9 @@ def avatar_for(role: str, character: str):
 def load_messages(character: str, user_id: int | None = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = """
-        SELECT id, role, content, created_at
+        SELECT id, role, content, created_at, reply_to_id, message_type, image_url
         FROM chat_messages_v2
-        WHERE user_id = :uid AND character = :ch
+        WHERE user_id = :uid AND character = :ch AND is_deleted = 0
         ORDER BY created_at
     """
     df = get_conn().query(q, params={"uid": uid, "ch": character}, ttl=0)
@@ -1346,23 +1354,24 @@ def load_messages(character: str, user_id: int | None = None):
     return recs
 
 
-def save_message(character: str, role: str, content: str, user_id: int | None = None):
+def save_message(character: str, role: str, content: str, user_id: int | None = None, message_type: str = "text", image_url: str = None, reply_to_id: int = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = text("""
-        INSERT INTO chat_messages_v2 (user_id, character, role, content)
-        VALUES (:uid, :ch, :role, :content)
+        INSERT INTO chat_messages_v2 (user_id, character, role, content, message_type, image_url, reply_to_id)
+        VALUES (:uid, :ch, :role, :content, :msg_type, :img_url, :reply_to)
     """)
     with get_conn().session as s:
-        s.execute(q, {"uid": uid, "ch": character, "role": role, "content": content})
+        s.execute(q, {"uid": uid, "ch": character, "role": role, "content": content, 
+                      "msg_type": message_type, "img_url": image_url, "reply_to": reply_to_id})
         s.commit()
 
 
 def get_latest_message_meta(character: str, user_id: int | None = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = """
-        SELECT id, role, content, created_at
+        SELECT id, role, content, created_at, reply_to_id, message_type, image_url
         FROM chat_messages_v2
-        WHERE user_id = :uid AND character = :ch
+        WHERE user_id = :uid AND character = :ch AND is_deleted = 0
         ORDER BY created_at DESC
         LIMIT 1
     """
@@ -1439,9 +1448,9 @@ def get_last_user_message_ts(history: list[dict]) -> float | None:
 def load_group_messages(user_id: int | None = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = """
-        SELECT id, speaker, role, content, created_at
+        SELECT id, speaker, role, content, created_at, reply_to_id, message_type, image_url
         FROM group_messages_v2
-        WHERE user_id = :uid
+        WHERE user_id = :uid AND is_deleted = 0
         ORDER BY created_at
     """
     df = get_conn().query(q, params={"uid": uid}, ttl=0)
@@ -1456,14 +1465,15 @@ def load_group_messages(user_id: int | None = None):
     return recs
 
 
-def save_group_message(speaker: str, role: str, content: str, user_id: int | None = None):
+def save_group_message(speaker: str, role: str, content: str, user_id: int | None = None, message_type: str = "text", image_url: str = None, reply_to_id: int = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = text("""
-        INSERT INTO group_messages_v2 (user_id, speaker, role, content)
-        VALUES (:uid, :sp, :role, :content)
+        INSERT INTO group_messages_v2 (user_id, speaker, role, content, message_type, image_url, reply_to_id)
+        VALUES (:uid, :sp, :role, :content, :msg_type, :img_url, :reply_to)
     """)
     with get_conn().session as s:
-        s.execute(q, {"uid": uid, "sp": speaker, "role": role, "content": content})
+        s.execute(q, {"uid": uid, "sp": speaker, "role": role, "content": content,
+                      "msg_type": message_type, "img_url": image_url, "reply_to": reply_to_id})
         s.commit()
 
 
@@ -1508,9 +1518,9 @@ def delete_group_messages(message_ids: list[int], user_id: int | None = None):
 def get_group_latest_message_meta(user_id: int | None = None):
     uid = user_id if user_id is not None else st.session_state.user_id
     q = """
-        SELECT id, speaker, role, content, created_at
+        SELECT id, speaker, role, content, created_at, reply_to_id, message_type, image_url
         FROM group_messages_v2
-        WHERE user_id = :uid
+        WHERE user_id = :uid AND is_deleted = 0
         ORDER BY created_at DESC
         LIMIT 1
     """
@@ -1702,6 +1712,20 @@ def render_group_typing(speaker: str):
 def render_history_manager(current_character: str):
     st.sidebar.divider()
     with st.sidebar.expander("聊天记录管理", expanded=False):
+        # 搜索功能
+        search_keyword = st.sidebar.text_input("🔍 搜索聊天记录", placeholder="输入关键词搜索", key=f"search_{current_character}")
+        if search_keyword:
+            search_results = search_messages(search_keyword, user_id, current_character if current_character != GROUP_CHAT else None)
+            if search_results:
+                st.sidebar.caption(f"找到 {len(search_results)} 条结果")
+                for msg in search_results[:10]:
+                    char = msg.get('character', msg.get('speaker', ''))
+                    role = "我" if msg.get('role') == 'user' else char
+                    st.sidebar.markdown(f"**{role}** ({msg['created_at'][:16]}): {msg['content'][:50]}...")
+            else:
+                st.sidebar.caption("未找到匹配的消息")
+        
+        # 显示/管理历史记录
         if current_character == GROUP_CHAT:
             history_rows = load_group_messages()
         else:
@@ -1731,6 +1755,50 @@ def render_history_manager(current_character: str):
                 st.rerun()
             else:
                 st.sidebar.info("未选择要删除的消息。")
+        
+        # 撤回功能
+        user_msgs = df[df["role"] == "user"] if "role" in df.columns else pd.DataFrame()
+        if not user_msgs.empty:
+            st.sidebar.markdown("---")
+            st.sidebar.caption("💬 撤回消息")
+            msg_choices = {f"{row.get('content', '')[:30]}... ({row.get('created_at', '')[:16]})": row.get('id') 
+                          for _, row in user_msgs.iterrows()}
+            if msg_choices:
+                selected_msg = st.sidebar.selectbox("选择要撤回的消息", list(msg_choices.keys()), key=f"withdraw_select_{current_character}")
+                if st.sidebar.button("撤回这条消息", key=f"withdraw_btn_{current_character}"):
+                    msg_id = msg_choices[selected_msg]
+                    table = "group_messages_v2" if current_character == GROUP_CHAT else "chat_messages_v2"
+                    withdraw_message(msg_id, table)
+                    st.sidebar.success("消息已撤回。")
+                    st.rerun()
+        
+        # 导出聊天记录
+        st.sidebar.markdown("---")
+        st.sidebar.caption("📥 导出聊天记录")
+        export_format = st.sidebar.radio("格式", ["JSON", "TXT"], horizontal=True, key=f"export_format_{current_character}")
+        if st.sidebar.button("导出当前角色聊天记录", key=f"export_{current_character}"):
+            export_data = history_rows
+            if export_format == "JSON":
+                export_str = json.dumps(export_data, ensure_ascii=False, indent=2)
+                st.sidebar.download_button(
+                    label="⬇️ 下载 JSON",
+                    data=export_str,
+                    file_name=f"chat_{current_character}_{datetime.now().strftime('%Y%m%d')}.json",
+                    mime="application/json"
+                )
+            else:
+                export_str = ""
+                for msg in export_data:
+                    role = msg.get("role", msg.get("speaker", ""))
+                    txt_content = msg.get("content", "")
+                    time = str(msg.get("created_at", ""))[:19]
+                    export_str += f"[{time}] {role}: {txt_content}\n\n"
+                st.sidebar.download_button(
+                    label="⬇️ 下载 TXT",
+                    data=export_str,
+                    file_name=f"chat_{current_character}_{datetime.now().strftime('%Y%m%d')}.txt",
+                    mime="text/plain"
+                )
 
 
 # =========================
@@ -1779,9 +1847,19 @@ def build_system_prompt(character: str, mode: str, sexy_mode: bool = False, user
 
 
 def call_openai(messages, temperature: float):
-    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+    # 优先使用 MiniMax，否则回退到 OpenAI
+    if "MINIMAX_API_KEY" in st.secrets:
+        client = OpenAI(
+            api_key=st.secrets["MINIMAX_API_KEY"],
+            base_url="https://api.minimax.chat/v1",
+        )
+        model = st.secrets.get("MINIMAX_MODEL", "MiniMax-M2.5")
+    else:
+        client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+        model = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
+    
     resp = client.chat.completions.create(
-        model=st.secrets.get("OPENAI_MODEL", "gpt-4o-mini"),
+        model=model,
         messages=messages,
         temperature=temperature,
         top_p=s_float("TOP_P", 1.0),
@@ -2538,6 +2616,56 @@ if character != GROUP_CHAT and st.session_state.mode == "教学":
 # =========================
 # 输入：用户发消息
 # =========================
+# 快捷表情
+QUICK_EMOJIS = ["😀", "😂", "😊", "😍", "🤔", "😅", "🙄", "😢", "😭", "😡", "👍", "👎", "❤️", "🎉", "🔥", "💪"]
+st.markdown("**💡快捷表情**")
+emoji_cols = st.columns(len(QUICK_EMOJIS))
+for i, emoji in enumerate(QUICK_EMOJIS):
+    if emoji_cols[i % len(emoji_cols)].button(emoji, key=f"emoji_{i}", use_container_width=True):
+        if character == GROUP_CHAT:
+            save_group_message("user", "user", emoji)
+        else:
+            save_message(character, "user", emoji)
+        st.rerun()
+
+# 深色模式
+dark_mode = s_int("DARK_MODE", 0)
+if st.sidebar.toggle("🌙 深色模式", value=bool(dark_mode), key="dark_mode_toggle"):
+    st.session_state.dark_mode = True
+else:
+    st.session_state.dark_mode = False
+
+# 应用深色模式CSS
+if st.session_state.get("dark_mode", False):
+    st.markdown("""
+    <style>
+    .main { background: #1e1e1e; }
+    .main .wx-bubble.bot { background: #2d2d2d; border-color: #3d3d3d; color: #e0e0e0; }
+    .main .wx-bubble.user { background: #4caf50; }
+    .main .wx-time span { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.6); }
+    .main section[data-testid="stSidebar"] { background: #252525; }
+    .main .wx-item { background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.1); }
+    .main .wx-title { color: #e0e0e0; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# 图片上传
+uploaded_file = st.file_uploader("📷 发送图片", type=["jpg", "jpeg", "png", "gif", "webp"], label_visibility="collapsed", key=f"img_upload_{current_character}")
+if uploaded_file:
+    img = Image.open(uploaded_file)
+    img.thumbnail((800, 800))
+    buf = io.BytesIO()
+    img.save(buf, format=img.format or "PNG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode()
+    img_url = f"data:image/{img.format or 'png'};base64,{img_b64}"
+    
+    if character == GROUP_CHAT:
+        save_group_message("user", "user", "[图片]", message_type="image", image_url=img_url)
+    else:
+        save_message(character, "user", "[图片]", message_type="image", image_url=img_url)
+    st.success("图片已发送！")
+    st.rerun()
+
 user_text = st.chat_input("输入消息…")
 if user_text:
     if character == GROUP_CHAT:
@@ -2590,3 +2718,32 @@ if user_text:
             st.rerun()
         start_pending_reply(character, st.session_state.mode, attachments=attachments)
         st.rerun()
+
+
+def withdraw_message(msg_id: int, table: str = "chat_messages_v2"):
+    """撤回消息（标记为已删除）"""
+    with get_conn().session as s:
+        s.execute(text(f"UPDATE {table} SET is_deleted = 1 WHERE id = :id"), {"id": msg_id})
+        s.commit()
+
+
+def search_messages(keyword: str, user_id: int, character: str = None, limit: int = 20):
+    """搜索消息"""
+    params = {"keyword": f"%{keyword}%", "user_id": user_id}
+    char_cond = "AND character = :character" if character else ""
+    
+    sql = text(f"""
+        SELECT id, character, role, content, created_at 
+        FROM chat_messages_v2 
+        WHERE user_id = :user_id AND content LIKE :keyword AND is_deleted = 0 {char_cond}
+        ORDER BY created_at DESC LIMIT :limit
+    """)
+    params["limit"] = limit
+    if character:
+        params["character"] = character
+    
+    try:
+        df = get_conn().query(sql, params=params)
+        return df.to_dict('records') if not df.empty else []
+    except:
+        return []
