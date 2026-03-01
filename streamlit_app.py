@@ -1748,6 +1748,22 @@ def render_history_manager(current_character: str):
                 st.rerun()
             else:
                 st.sidebar.info("未选择要删除的消息。")
+        
+        # 撤回功能 - 只显示用户自己发送的消息
+        user_msgs = df[df["role"] == "user"] if "role" in df.columns else pd.DataFrame()
+        if not user_msgs.empty:
+            st.sidebar.markdown("---")
+            st.sidebar.caption("💬 撤回消息")
+            msg_choices = {f"{row.get('content', '')[:30]}... ({row.get('created_at', '')[:16]})": row.get('id') 
+                          for _, row in user_msgs.iterrows()}
+            if msg_choices:
+                selected_msg = st.sidebar.selectbox("选择要撤回的消息", list(msg_choices.keys()), key=f"withdraw_select_{current_character}")
+                if st.sidebar.button("撤回这条消息", key=f"withdraw_btn_{current_character}"):
+                    msg_id = msg_choices[selected_msg]
+                    table = "group_messages_v2" if current_character == GROUP_CHAT else "chat_messages_v2"
+                    withdraw_message(msg_id, table)
+                    st.sidebar.success("消息已撤回。")
+                    st.rerun()
 
 
 # =========================
