@@ -1733,7 +1733,7 @@ def render_history_manager(current_character: str):
 
 
 # =========================
-# OpenAI：聊天/教学
+# AI：聊天/教学（支持 MiniMax / OpenAI）
 # =========================
 def build_system_prompt(character: str, mode: str, sexy_mode: bool = False, user_prompt: str = "") -> str:
     base_persona = f"你在扮演{character}，性格是：{CHARACTERS[character]}。"
@@ -1778,9 +1778,19 @@ def build_system_prompt(character: str, mode: str, sexy_mode: bool = False, user
 
 
 def call_openai(messages, temperature: float):
-    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+    # 优先使用 MiniMax，否则回退到 OpenAI
+    if "MINIMAX_API_KEY" in st.secrets:
+        client = OpenAI(
+            api_key=st.secrets["MINIMAX_API_KEY"],
+            base_url="https://api.minimax.chat/v1",
+        )
+        model = st.secrets.get("MINIMAX_MODEL", "MiniMax-M2.5")
+    else:
+        client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+        model = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
+    
     resp = client.chat.completions.create(
-        model=st.secrets.get("OPENAI_MODEL", "gpt-4o-mini"),
+        model=model,
         messages=messages,
         temperature=temperature,
         top_p=s_float("TOP_P", 1.0),
