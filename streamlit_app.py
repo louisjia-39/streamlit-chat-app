@@ -499,6 +499,51 @@ def ensure_tables_safe():
         s.commit()
 
 
+def migrate_add_missing_columns():
+    """迁移：添加可能缺失的列"""
+    c = get_conn()
+    is_sqlite = isinstance(c, LocalSQLiteConnection)
+    
+    # 需要检查并添加的列
+    columns_to_add = [
+        ("chat_messages_v2", "reply_to_id", "INTEGER"),
+        ("chat_messages_v2", "is_deleted", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("chat_messages_v2", "message_type", "TEXT NOT NULL DEFAULT 'text'"),
+        ("chat_messages_v2", "image_url", "TEXT"),
+        ("group_messages_v2", "reply_to_id", "INTEGER"),
+        ("group_messages_v2", "is_deleted", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("group_messages_v2", "message_type", "TEXT NOT NULL DEFAULT 'text'"),
+        ("group_messages_v2", "image_url", "TEXT"),
+    ]
+    
+    with c.session as s:
+        for table, column, col_type in columns_to_add:
+            try:
+                if is_sqlite:
+                    # SQLite: 检查列是否存在
+                    check_sql = f"PRAGMA table_info({table})"
+                    df = pd.read_sql(text(check_sql), s.connection)
+                    existing_cols = df["name"].tolist() if not df.empty else []
+                    if column not in existing_cols:
+                        s.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
+                else:
+                    # PostgreSQL: 使用 DO $$ 块检查并添加
+                    s.execute(text(f"""
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                                SELECT 1 FROM information_schema.columns 
+                                WHERE table_name = '{table}' AND column_name = '{column}'
+                            ) THEN
+                                ALTER TABLE {table} ADD COLUMN {column} {col_type};
+                            END IF;
+                        END $$;
+                    """))
+            except Exception:
+                pass  # 列可能已存在，跳过
+        s.commit()
+
+
 def get_override_code_db(week_id: str) -> str | None:
     try:
         df = get_conn().query(
@@ -919,6 +964,7 @@ def try_consume_usage() -> bool:
 # 初始化 DB
 try:
     ensure_tables_safe()
+    migrate_add_missing_columns()
 except Exception as e:
     st.error("数据库连接失败（Neon）。请点右下角 Manage app → Logs 看真实原因。")
     st.exception(e)
