@@ -1620,6 +1620,24 @@ def fmt_time_label(dt: datetime) -> str:
     return local_dt.strftime("%m/%d %H:%M")
 
 
+def fmt_created_at(value, default: str = "") -> str:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value[:16]
+    if hasattr(value, "to_pydatetime"):
+        try:
+            value = value.to_pydatetime()
+        except Exception:
+            return str(value)[:16]
+    if hasattr(value, "strftime"):
+        try:
+            return value.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+    return str(value)[:16]
+
+
 def bucket_key(dt: datetime) -> str:
     gran = SETTINGS.get("TIME_DIVIDER_GRANULARITY", "minute")
     try:
@@ -1779,7 +1797,8 @@ def render_history_manager(current_character: str):
                 for msg in search_results[:10]:
                     char = msg.get('character', msg.get('speaker', ''))
                     role = "我" if msg.get('role') == 'user' else char
-                    st.sidebar.markdown(f"**{role}** ({msg['created_at'][:16]}): {msg['content'][:50]}...")
+                    created_at_label = fmt_created_at(msg.get("created_at"))
+                    st.sidebar.markdown(f"**{role}** ({created_at_label}): {msg['content'][:50]}...")
             else:
                 st.sidebar.caption("未找到匹配的消息")
         
@@ -1819,8 +1838,10 @@ def render_history_manager(current_character: str):
         if not user_msgs.empty:
             st.sidebar.markdown("---")
             st.sidebar.caption("💬 撤回消息")
-            msg_choices = {f"{row.get('content', '')[:30]}... ({row.get('created_at', '')[:16]})": row.get('id') 
-                          for _, row in user_msgs.iterrows()}
+            msg_choices = {
+                f"{row.get('content', '')[:30]}... ({fmt_created_at(row.get('created_at'))})": row.get('id')
+                for _, row in user_msgs.iterrows()
+            }
             if msg_choices:
                 selected_msg = st.sidebar.selectbox("选择要撤回的消息", list(msg_choices.keys()), key=f"withdraw_select_{current_character}")
                 if st.sidebar.button("撤回这条消息", key=f"withdraw_btn_{current_character}"):
@@ -2708,7 +2729,12 @@ if st.session_state.get("dark_mode", False):
     """, unsafe_allow_html=True)
 
 # 图片上传
-uploaded_file = st.file_uploader("📷 发送图片", type=["jpg", "jpeg", "png", "gif", "webp"], label_visibility="collapsed", key=f"img_upload_{current_character}")
+uploaded_file = st.file_uploader(
+    "📷 发送图片",
+    type=["jpg", "jpeg", "png", "gif", "webp"],
+    label_visibility="collapsed",
+    key=f"img_upload_{character}",
+)
 if uploaded_file:
     img = Image.open(uploaded_file)
     img.thumbnail((800, 800))
