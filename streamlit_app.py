@@ -185,6 +185,13 @@ section[data-testid="stSidebar"] { background:#F7F7F7; }
 .wx-row { display:flex; gap:8px; margin:6px 0; align-items:flex-start; }
 .wx-row.bot { justify-content:flex-start; }
 .wx-row.user { justify-content:flex-end; }
+.wx-message-stack {
+  display:flex;
+  flex-direction:column;
+  max-width: min(72%, 620px);
+}
+.wx-row.user .wx-message-stack { align-items:flex-end; }
+.wx-row.bot .wx-message-stack { align-items:flex-start; }
 
 /* 头像 */
 .wx-avatar {
@@ -198,7 +205,8 @@ section[data-testid="stSidebar"] { background:#F7F7F7; }
 
 /* 气泡 */
 .wx-bubble {
-  max-width: min(72%, 620px);
+  width: fit-content;
+  max-width: 100%;
   padding: 9px 12px;
   border-radius: 14px;
   font-size: 16px;
@@ -211,6 +219,11 @@ section[data-testid="stSidebar"] { background:#F7F7F7; }
 .wx-bubble p { margin: 0; }
 .wx-bubble ul, .wx-bubble ol { margin: 0.3em 0 0.3em 1.1em; }
 .wx-bubble li { margin: 0.1em 0; }
+.wx-bubble img {
+  display:block;
+  max-width: 200px;
+  border-radius: 8px;
+}
 .wx-bubble.bot { background:#FFFFFF; border:1px solid rgba(0,0,0,.06); }
 .wx-bubble.user { background:#95EC69; border:1px solid rgba(0,0,0,.03); }
 
@@ -1683,70 +1696,86 @@ def _avatar_html(avatar):
     return f'<div class="wx-avatar">{safe}</div>'
 
 
-def _message_to_markdown(content: str) -> str:
-    safe_text = (content or "").replace("<", "&lt;").replace(">", "&gt;")
-    return safe_text.replace("\n", "  \n")
+def sanitize_model_output(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"<think\b[^>]*>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"^\s*<think>\s*$", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"^\s*</think>\s*$", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"^\s*think\s*:\s*.*$", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _message_to_html(content: str) -> str:
+    safe_text = _html.escape(content or "")
+    return safe_text.replace("\n", "<br>")
+
+
+def _bubble_inner_html(content: str, message_type: str = "text", image_url: str = None) -> str:
+    if message_type == "image" and image_url:
+        safe_url = _html.escape(image_url, quote=True)
+        return f'<img src="{safe_url}" alt="uploaded image" />'
+    return _message_to_html(content)
 
 
 def render_message(role: str, character: str, content: str, message_type: str = "text", image_url: str = None):
     is_user = (role == "user")
     avatar = avatar_for("user" if is_user else "assistant", character)
-    safe_md = _message_to_markdown(content)
+    bubble_inner = _bubble_inner_html(content, message_type, image_url)
+    row_class = "user" if is_user else "bot"
+    avatar_html = _avatar_html(avatar)
 
     if is_user:
-        st.markdown('<div class="wx-row user">', unsafe_allow_html=True)
-        st.markdown('<div class="wx-bubble user">', unsafe_allow_html=True)
-        if message_type == "image" and image_url:
-            st.markdown(f'<img src="{image_url}" style="max-width:200px;border-radius:8px;" />', unsafe_allow_html=True)
-        else:
-            st.markdown(safe_md)
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        html_block = f"""
+        <div class="wx-row {row_class}">
+            <div class="wx-message-stack">
+                <div class="wx-bubble user">{bubble_inner}</div>
+            </div>
+            {avatar_html}
+        </div>
+        """
     else:
-        st.markdown('<div class="wx-row bot">', unsafe_allow_html=True)
-        st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
-        st.markdown('<div class="wx-bubble bot">', unsafe_allow_html=True)
-        if message_type == "image" and image_url:
-            st.markdown(f'<img src="{image_url}" style="max-width:200px;border-radius:8px;" />', unsafe_allow_html=True)
-        else:
-            st.markdown(safe_md)
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        html_block = f"""
+        <div class="wx-row {row_class}">
+            {avatar_html}
+            <div class="wx-message-stack">
+                <div class="wx-bubble bot">{bubble_inner}</div>
+            </div>
+        </div>
+        """
+    st.markdown(html_block, unsafe_allow_html=True)
 
 
 def render_group_message(role: str, speaker: str, content: str, message_type: str = "text", image_url: str = None):
     is_user = (role == "user")
     avatar = avatar_for("user" if is_user else "assistant", speaker)
-    safe_md = _message_to_markdown(content)
+    bubble_inner = _bubble_inner_html(content, message_type, image_url)
     safe_name = "你" if is_user else _html.escape(speaker)
+    avatar_html = _avatar_html(avatar)
 
     if is_user:
-        st.markdown('<div class="wx-row user">', unsafe_allow_html=True)
-        st.markdown('<div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="wx-name user">{safe_name}</div>', unsafe_allow_html=True)
-        st.markdown('<div class="wx-bubble user">', unsafe_allow_html=True)
-        if message_type == "image" and image_url:
-            st.markdown(f'<img src="{image_url}" style="max-width:200px;border-radius:8px;" />', unsafe_allow_html=True)
-        else:
-            st.markdown(safe_md)
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        html_block = f"""
+        <div class="wx-row user">
+            <div class="wx-message-stack">
+                <div class="wx-name user">{safe_name}</div>
+                <div class="wx-bubble user">{bubble_inner}</div>
+            </div>
+            {avatar_html}
+        </div>
+        """
     else:
-        st.markdown('<div class="wx-row bot">', unsafe_allow_html=True)
-        st.markdown(_avatar_html(avatar), unsafe_allow_html=True)
-        st.markdown('<div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="wx-name">{safe_name}</div>', unsafe_allow_html=True)
-        st.markdown('<div class="wx-bubble bot">', unsafe_allow_html=True)
-        if message_type == "image" and image_url:
-            st.markdown(f'<img src="{image_url}" style="max-width:200px;border-radius:8px;" />', unsafe_allow_html=True)
-        else:
-            st.markdown(safe_md)
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        html_block = f"""
+        <div class="wx-row bot">
+            {avatar_html}
+            <div class="wx-message-stack">
+                <div class="wx-name">{safe_name}</div>
+                <div class="wx-bubble bot">{bubble_inner}</div>
+            </div>
+        </div>
+        """
+    st.markdown(html_block, unsafe_allow_html=True)
 
 
 def render_typing(character: str):
@@ -1945,11 +1974,11 @@ def call_openai(messages, temperature: float):
         presence_penalty=s_float("PRESENCE_PENALTY", 0.7),
         frequency_penalty=s_float("FREQUENCY_PENALTY", 0.25),
     )
-    return resp.choices[0].message.content
+    return sanitize_model_output(resp.choices[0].message.content)
 
 
 def parse_chat_messages(raw: str, max_messages: int = 5) -> list[str]:
-    raw = (raw or "").strip()
+    raw = sanitize_model_output(raw)
     try:
         arr = json.loads(raw)
         if isinstance(arr, list):
@@ -2032,12 +2061,14 @@ def get_ai_reply(
     raw = call_openai(messages, temp)
 
     if mode == "教学":
-        return [raw.strip()]
+        cleaned = sanitize_model_output(raw)
+        return [cleaned or "嗯？"]
 
     parsed = parse_chat_messages(raw)
     chunks = split_into_message_chunks(parsed, min_sentences=1, max_sentences=2)
     msgs = pick_random_messages(chunks)
-    return msgs if msgs else [raw.strip() or "嗯？"]
+    fallback = sanitize_model_output(raw)
+    return msgs if msgs else [fallback or "嗯？"]
 
 
 def build_group_system_prompt(character: str) -> str:
@@ -2069,7 +2100,8 @@ def get_group_ai_reply(character: str, history: list[dict]) -> list[str]:
     raw = call_openai(messages, s_float("TEMP_CHAT", 1.05))
     parsed = parse_chat_messages(raw)
     msgs = split_into_message_chunks(parsed, min_sentences=1, max_sentences=2)
-    return msgs if msgs else [raw.strip() or "嗯？"]
+    fallback = sanitize_model_output(raw)
+    return msgs if msgs else [fallback or "嗯？"]
 
 
 def get_group_proactive_message(character: str, history: list[dict]) -> list[str]:
